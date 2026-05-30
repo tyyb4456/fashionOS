@@ -1,0 +1,6 @@
+langgraph
+langchain 
+langchain-mcp-adapters
+fastmcp
+dotenv
+httpx
