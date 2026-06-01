@@ -4,3 +4,4 @@ langchain-mcp-adapters
 fastmcp
 dotenv
 httpx
+langcache

@@ -21,7 +21,7 @@ load_dotenv()
 
 SHOPIFY_SHOP  = os.getenv("SHOPIFY_SHOP_NAME")   # e.g. "my-brand" (no .myshopify.com)
 SHOPIFY_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN") # Admin API access token
-API_VERSION   = "2024-10"
+API_VERSION   = "2026-04"
 BASE_URL      = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/{API_VERSION}"
 HEADERS       = {
     "X-Shopify-Access-Token": SHOPIFY_TOKEN,
@@ -373,4 +373,8 @@ async def create_restock_recommendation(
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8001)
+    import sys
+    if "--stdio" in sys.argv:
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=8001)
