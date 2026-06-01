@@ -1,0 +1,195 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# FashionOS — Local Development Stack
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Brings up:  PostgreSQL · Redis · ChromaDB · shopify-mcp
+#
+# Quick start:
+#   cp .env.example .env && nano .env          ← fill in your Shopify creds
+#   cp mcp_servers/shopify_mcp/.env.example mcp_servers/shopify_mcp/.env
+#   docker compose up -d                       ← start everything
+#   docker compose logs -f shopify-mcp         ← check MCP server is alive
+#   docker compose down -v                     ← nuke volumes (fresh start)
+#
+# Ports used:
+#   5432  → PostgreSQL
+#   6379  → Redis
+#   8000  → ChromaDB
+#   8001  → shopify-mcp   (BUILT)
+#   8002  → social-mcp    (TODO — Apify TikTok/IG)
+#   8003  → trends-mcp    (TODO — Pytrends)
+#   8004  → ads-mcp       (TODO — Meta Marketing API)
+#   8005  → notify-mcp    (TODO — Twilio + Resend)
+#   8080  → FastAPI app   (TODO — uncomment when api/ is built)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── INFRASTRUCTURE ───────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: fashionos_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       fashionos
+      POSTGRES_USER:     fashionos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fashionos_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fashionos -d fashionos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: fashionos_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: fashionos_chroma
+    restart: unless-stopped
+    environment:
+      CHROMA_SERVER_HOST:      "0.0.0.0"
+      CHROMA_SERVER_HTTP_PORT: "8000"
+      ANONYMIZED_TELEMETRY:    "false"
+      ALLOW_RESET:             "true"    # set to "false" in production
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── MCP SERVERS ──────────────────────────────────────────────────────────────
+
+  shopify-mcp:
+    build:
+      context:    ./mcp_servers/shopify_mcp
+      dockerfile: Dockerfile
+    container_name: fashionos_shopify_mcp
+    restart: unless-stopped
+    # Loads SHOPIFY_SHOP_NAME + SHOPIFY_ACCESS_TOKEN from its own .env file
+    env_file: ./mcp_servers/shopify_mcp/.env
+    ports:
+      - "8001:8001"
+    healthcheck:
+      # Checks the port is accepting connections (FastMCP SSE endpoint)
+      test:
+        - "CMD-SHELL"
+        - >
+          python -c "
+          import socket, sys;
+          s = socket.socket();
+          s.settimeout(3);
+          s.connect(('localhost', 8001));
+          s.close();
+          sys.exit(0)
+          "
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # social-mcp:
+  #   build: { context: ./mcp_servers/social_mcp, dockerfile: Dockerfile }
+  #   container_name: fashionos_social_mcp
+  #   env_file: ./mcp_servers/social_mcp/.env
+  #   ports: ["8002:8002"]
+
+  # trends-mcp:
+  #   build: { context: ./mcp_servers/trends_mcp, dockerfile: Dockerfile }
+  #   container_name: fashionos_trends_mcp
+  #   ports: ["8003:8003"]
+
+  # ads-mcp:
+  #   build: { context: ./mcp_servers/ads_mcp, dockerfile: Dockerfile }
+  #   container_name: fashionos_ads_mcp
+  #   env_file: ./mcp_servers/ads_mcp/.env
+  #   ports: ["8004:8004"]
+
+  # notify-mcp:
+  #   build: { context: ./mcp_servers/notify_mcp, dockerfile: Dockerfile }
+  #   container_name: fashionos_notify_mcp
+  #   env_file: ./mcp_servers/notify_mcp/.env
+  #   ports: ["8005:8005"]
+
+  # ── APP SERVICES — Uncomment once api/ and workers/ are built ────────────────
+
+  # fashionos-api:
+  #   build: { context: ., dockerfile: Dockerfile }
+  #   container_name: fashionos_api
+  #   command: uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
+  #   env_file: .env
+  #   ports: ["8080:8080"]
+  #   volumes:
+  #     - .:/app                          # live reload in dev
+  #   depends_on:
+  #     postgres:    { condition: service_healthy }
+  #     redis:       { condition: service_healthy }
+  #     shopify-mcp: { condition: service_healthy }
+
+  # fashionos-worker:
+  #   build: { context: ., dockerfile: Dockerfile }
+  #   container_name: fashionos_worker
+  #   command: celery -A api.workers.tasks worker --loglevel=info --concurrency=4
+  #   env_file: .env
+  #   depends_on:
+  #     redis:    { condition: service_healthy }
+  #     postgres: { condition: service_healthy }
+
+  # ── OBSERVABILITY — Uncomment for trace monitoring ────────────────────────────
+
+  # langfuse:
+  #   image: langfuse/langfuse:latest
+  #   container_name: fashionos_langfuse
+  #   ports: ["3000:3000"]
+  #   environment:
+  #     DATABASE_URL: postgresql://fashionos:${POSTGRES_PASSWORD:-fashionos_dev}@postgres/fashionos
+  #     NEXTAUTH_SECRET: ${LANGFUSE_SECRET:-dev-secret-change-in-prod}
+  #     NEXTAUTH_URL: http://localhost:3000
+  #   depends_on:
+  #     postgres: { condition: service_healthy }
+
+# ── VOLUMES ───────────────────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  chroma_data:
+    driver: local
+
+# ── NETWORK ───────────────────────────────────────────────────────────────────
+
+networks:
+  default:
+    name: fashionos_net
+    driver: bridge

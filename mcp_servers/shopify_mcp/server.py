@@ -141,7 +141,7 @@ async def get_recent_orders(hours: int = 24, paid_only: bool = True) -> list[dic
     Returns orders with their line items (sku, quantity, price).
     Used by: Inventory Agent (velocity), Pricing Agent, Marketing Agent.
     """
-    since = (datetime.utcnow() - timedelta(hours=hours)).isoformat() + "Z"
+    since = (datetime.now() - timedelta(hours=hours)).isoformat() + "Z"
     params: dict = {
         "created_at_min": since,
         "limit":          250,
