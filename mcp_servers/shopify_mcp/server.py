@@ -128,6 +128,58 @@ async def get_product_by_sku(sku: str) -> Optional[dict]:
                 }
     return None
 
+@mcp.tool()
+async def get_price_rules(active_only: bool = True) -> list[dict]:
+    """
+    Fetch all price rules (discounts) currently configured in Shopify.
+
+    Args:
+        active_only: If True, only returns rules that are currently active
+                     (started but not yet expired). Default True.
+
+    Returns a list of price rules with title, value, and validity window.
+    Used by: Pricing Agent (double-discount prevention).
+    """
+    from datetime import timezone  # add this import
+
+    data = await _get("price_rules.json", {
+        "limit":  250,
+        "fields": "id,title,value_type,value,starts_at,ends_at,created_at",
+    })
+
+    now = datetime.now(timezone.utc)  # ← aware datetime, matches Shopify's format
+
+    rules = []
+    for r in data.get("price_rules", []):
+        starts_at = r.get("starts_at")
+        ends_at   = r.get("ends_at")
+
+        if active_only:
+            if starts_at:
+                starts_dt = datetime.fromisoformat(starts_at)
+                if starts_dt.tzinfo is None:
+                    starts_dt = starts_dt.replace(tzinfo=timezone.utc)
+                if starts_dt > now:
+                    continue
+
+            if ends_at:
+                ends_dt = datetime.fromisoformat(ends_at)
+                if ends_dt.tzinfo is None:
+                    ends_dt = ends_dt.replace(tzinfo=timezone.utc)
+                if ends_dt < now:
+                    continue
+
+        rules.append({
+            "rule_id":    r["id"],
+            "title":      r.get("title", ""),
+            "value_type": r.get("value_type", ""),
+            "value":      r.get("value", "0"),
+            "starts_at":  starts_at,
+            "ends_at":    ends_at,
+            "created_at": r.get("created_at"),
+        })
+
+    return rules
 
 @mcp.tool()
 async def get_recent_orders(hours: int = 24, paid_only: bool = True) -> list[dict]:

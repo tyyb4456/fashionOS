@@ -1,7 +1,27 @@
 langgraph
 langchain 
 langchain-mcp-adapters
+langchain[google-genai]
 fastmcp
 dotenv
 httpx
 langcache
+fastapi
+uvicorn[standard]
+celery[redis]
+redis
+ngrok
+
+
+# huggingface and related libraries
+
+langchain-huggingface 
+text-generation 
+transformers 
+google-search-results 
+numexpr 
+langchainhub 
+sentencepiece 
+jinja2 
+bitsandbytes 
+accelerate
