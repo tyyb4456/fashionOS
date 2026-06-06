@@ -525,11 +525,8 @@ if __name__ == "__main__":
             result["inventory_snapshot"],
             key=lambda s: s["days_of_stock_remaining"]
         ):
-            urgency_emoji = {
-                "critical": "🔴", "high": "🟠", "normal": "🟡", "healthy": "🟢"
-            }.get(snap["urgency"], "⚪")
             print(
-                f"  {urgency_emoji} {snap['sku']:<20} "
+                f"  {snap['sku']:<20} "
                 f"{snap['urgency'].upper():<10} "
                 f"{snap['days_of_stock_remaining']:>6.1f} days  "
                 f"({snap['current_stock']} units @ {snap['units_per_day']}/day)"
@@ -537,9 +534,8 @@ if __name__ == "__main__":
 
         print("\n── ALERTS ─────────────────────────────────────────────────────")
         for alert in result["alerts"]:
-            icon = {"critical": "🚨", "warning": "⚠️ ", "info": "ℹ️ "}.get(alert["level"], "  ")
             sku_tag = f" [{alert['sku']}]" if alert.get("sku") else ""
-            print(f"  {icon} {alert['level'].upper()}{sku_tag}: {alert['message']}")
+            print(f"{alert['level'].upper()}{sku_tag}: {alert['message']}")
 
         print("\n── DONE ───────────────────────────────────────────────────────\n")
 

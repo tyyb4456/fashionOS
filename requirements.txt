@@ -3,7 +3,7 @@ langchain
 langchain-mcp-adapters
 langchain[google-genai]
 fastmcp
-dotenv
+python-dotenv
 httpx
 langcache
 fastapi
@@ -11,6 +11,11 @@ uvicorn[standard]
 celery[redis]
 redis
 ngrok
+
+sqlalchemy[asyncio] 
+asyncpg                  
+psycopg2-binary          
+alembic                   
 
 
 # huggingface and related libraries

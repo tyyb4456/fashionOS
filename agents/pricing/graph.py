@@ -540,7 +540,7 @@ async def execute_pricing_actions(state: PricingAgentState) -> dict:
                 })
                 auto_count += 1
                 print(
-                    f"[Pricing] ✅ Auto-executed {d.action} on {d.sku}: "
+                    f"[Pricing] 🗸 Auto-executed {d.action} on {d.sku}: "
                     f"PKR {d.current_price} → PKR {d.recommended_price} "
                     f"({d.discount_pct:.0f}% off)"
                 )
@@ -560,7 +560,7 @@ async def execute_pricing_actions(state: PricingAgentState) -> dict:
 
             except Exception as exc:
                 fail_count += 1
-                print(f"[Pricing] ❌ Failed to execute on {d.sku}: {exc}")
+                print(f"[Pricing] 🗴 Failed to execute on {d.sku}: {exc}")
                 alerts.append(AgentAlert(
                     level      = "warning",
                     agent      = "pricing_agent",
@@ -678,23 +678,15 @@ if __name__ == "__main__":
 
         result = await pricing_graph.ainvoke(initial_state)
 
-        ACTION_EMOJI = {
-            "hold":           "🔵",
-            "markdown":       "🟡",
-            "increase":       "🟢",
-            "clearance_code": "🔴",
-            "bundle":         "🟣",
-        }
-        EXEC_LABEL = {True: "AUTO", False: "PENDING"}
+
 
         print("\n── PRICING DECISIONS ──────────────────────────────────────────")
         for rec in result["pricing_recommendations"]:
             action  = rec.get("action", "hold")
-            emoji   = ACTION_EMOJI.get(action, "⚪")
             change  = rec["recommended_price"] - rec["current_price"]
             sign    = "+" if change >= 0 else ""
             print(
-                f"  {emoji} {rec['sku']:<20} "
+                f" {rec['sku']:<20} "
                 f"{action.upper():<16} "
                 f"PKR {rec['current_price']:>6.0f} → {rec['recommended_price']:>6.0f} "
                 f"({sign}{change:.0f})"
@@ -702,8 +694,7 @@ if __name__ == "__main__":
 
         print("\n── ALERTS ─────────────────────────────────────────────────────")
         for alert in result["alerts"]:
-            icon = {"critical": "🚨", "warning": "⚠️ ", "info": "ℹ️ "}.get(alert["level"], "  ")
-            print(f"  {icon} {alert['level'].upper()} [{alert.get('sku', '—')}]: {alert['message']}")
+            print(f"  {alert['level'].upper()} [{alert.get('sku', '—')}]: {alert['message']}")
 
         print("\n── DONE ───────────────────────────────────────────────────────\n")
 

@@ -18,6 +18,11 @@ Start (prod — via docker-compose):
 import os
 from contextlib import asynccontextmanager
 
+
+from dotenv import load_dotenv
+load_dotenv()   # load .env BEFORE any router modules read os.getenv()
+
+
 import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

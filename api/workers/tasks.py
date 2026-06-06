@@ -22,7 +22,6 @@ Beat scheduler (for scheduled runs):
 """
 
 import asyncio
-import json
 import os
 from datetime import datetime, timezone
 
@@ -31,6 +30,8 @@ from celery.schedules import crontab
 from celery.utils.log import get_task_logger
 
 from agents.supervisor import make_initial_state, supervisor_graph
+from db import crud
+from db.session import AsyncSessionLocal
 
 
 # ── Celery app setup ──────────────────────────────────────────────────────────
@@ -50,17 +51,17 @@ celery_app.conf.update(
     accept_content    = ["json"],
 
     # Reliability
-    task_acks_late            = True,   # ack AFTER task completes, not before
-    task_reject_on_worker_lost = True,  # re-queue if worker dies mid-task
-    worker_prefetch_multiplier = 1,     # one task at a time per worker thread
-                                        # (agent tasks are heavy, don't prefetch)
+    task_acks_late             = True,   # ack AFTER task completes, not before
+    task_reject_on_worker_lost = True,   # re-queue if worker dies mid-task
+    worker_prefetch_multiplier = 1,      # one task at a time per worker thread
+                                         # (agent tasks are heavy, don't prefetch)
 
     # Result expiry (keep for 24h for dashboard queries)
     result_expires = 86400,
 
     # Timezone
-    timezone           = "Asia/Karachi",
-    enable_utc         = True,
+    timezone   = "Asia/Karachi",
+    enable_utc = True,
 
     # ── Beat schedule (periodic tasks) ───────────────────────────────────────
     beat_schedule = {
@@ -69,7 +70,7 @@ celery_app.conf.update(
             "task":     "api.workers.tasks.run_scheduled_inventory",
             "schedule": crontab(minute=0),   # top of every hour
         },
-        # Daily full sweep — inventory + (trend/pricing when built)
+        # Daily full sweep — inventory + pricing (+ trend/restock once built)
         "daily-full-sweep": {
             "task":     "api.workers.tasks.run_scheduled_daily",
             "schedule": crontab(hour=0, minute=5),   # 00:05 PKT daily
@@ -80,7 +81,7 @@ celery_app.conf.update(
 logger = get_task_logger(__name__)
 
 
-# ── Helper: run async graph in sync Celery context ────────────────────────────
+# ── Helper: run async coroutine in sync Celery context ────────────────────────
 
 def _run_async(coro):
     """
@@ -121,7 +122,7 @@ def run_agent_pipeline(
     Called by:
       - Shopify webhook handler (orders/paid, inventory_levels/update, etc.)
       - Scheduled beat tasks (run_scheduled_inventory, run_scheduled_daily)
-      - Manual API endpoint (POST /api/v1/run)
+      - Manual API endpoint (POST /api/v1/webhooks/manual-run)
 
     Args:
         brand_id:        Brand identifier (multi-tenancy key).
@@ -133,8 +134,8 @@ def run_agent_pipeline(
     Returns:
         dict with run_id, run_summary, completed_agents, alert counts.
     """
-    task_id   = self.request.id
-    started   = datetime.now(timezone.utc).isoformat()
+    task_id = self.request.id
+    started = datetime.now(timezone.utc).isoformat()
 
     logger.info(
         f"[{task_id}] Starting pipeline | brand={brand_name} | "
@@ -150,10 +151,10 @@ def run_agent_pipeline(
             agents_to_run   = agents_to_run,
         )
 
-        # Run the full supervisor graph (sync wrapper around async graph)
+        # ── Run the full supervisor graph ─────────────────────────────────────
         result = _run_async(supervisor_graph.ainvoke(initial_state))
 
-        # ── Build return payload ───────────────────────────────────────────
+        # ── Build return payload ──────────────────────────────────────────────
         alerts   = result.get("alerts", [])
         critical = [a for a in alerts if a.get("level") == "critical"]
         warnings = [a for a in alerts if a.get("level") == "warning"]
@@ -161,19 +162,19 @@ def run_agent_pipeline(
         pricing      = result.get("pricing_recommendations", [])
         auto_priced  = [p for p in pricing if p.get("action") == "markdown"
                         and p.get("discount_pct", 0) <= 15]
-        pending_price= [p for p in pricing if p.get("action")
+        pending_price = [p for p in pricing if p.get("action")
                         in ("markdown", "clearance_code", "increase", "bundle")
                         and p.get("discount_pct", 0) > 15]
 
         summary = {
-            "run_id":            result.get("run_id", initial_state["run_id"]),
-            "brand_id":          brand_id,
-            "brand_name":        brand_name,
-            "trigger":           trigger,
-            "started_at":        started,
-            "completed_at":      result.get("completed_at"),
-            "completed_agents":  result.get("completed_agents", []),
-            "run_summary":       result.get("run_summary", ""),
+            "run_id":           result.get("run_id", initial_state["run_id"]),
+            "brand_id":         brand_id,
+            "brand_name":       brand_name,
+            "trigger":          trigger,
+            "started_at":       started,
+            "completed_at":     result.get("completed_at"),
+            "completed_agents": result.get("completed_agents", []),
+            "run_summary":      result.get("run_summary", ""),
             "alert_counts": {
                 "critical": len(critical),
                 "warning":  len(warnings),
@@ -181,23 +182,38 @@ def run_agent_pipeline(
             },
             "inventory_skus_analysed": len(result.get("inventory_snapshot", [])),
             "pricing": {
-                "total_decisions":    len(pricing),
-                "auto_executed":      len(auto_priced),
-                "pending_approval":   len(pending_price),
+                "total_decisions":  len(pricing),
+                "auto_executed":    len(auto_priced),
+                "pending_approval": len(pending_price),
             },
             "task_id": task_id,
         }
 
         logger.info(
-            f"[{task_id}] 🗸 Pipeline complete | "
+            f"[{task_id}] ✓ Pipeline complete | "
             f"agents={summary['completed_agents']} | "
             f"alerts={summary['alert_counts']}"
         )
 
-        # TODO: persist summary to PostgreSQL (db.models.AgentRun)
-        # await save_run_to_db(summary, result)
+        # ── Persist to PostgreSQL ─────────────────────────────────────────────
+        # DB failure is non-fatal: the pipeline already completed successfully.
+        # Log the error but do NOT re-raise — that would trigger a full retry
+        # of the entire agent pipeline just to fix a DB write, which is wrong.
+        async def _save_to_db():
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    await crud.save_run(session, summary, result)
 
-        # TODO: push critical alerts to notify-mcp (Twilio WhatsApp) when built
+        try:
+            _run_async(_save_to_db())
+            logger.info(f"[{task_id}] DB: Run persisted (run_id={summary['run_id']}).")
+        except Exception as db_exc:
+            logger.error(
+                f"[{task_id}] DB: Persist failed (non-fatal) — {db_exc}",
+                exc_info=True,
+            )
+
+        # ── TODO: push critical alerts to notify-mcp (Twilio WhatsApp) ───────
         # if critical:
         #     notify_task.delay(brand_id, critical)
 
@@ -220,7 +236,7 @@ def run_scheduled_inventory():
     Fires every hour via Celery beat.
     Runs inventory agent only — fast, targeted stockout monitoring.
 
-    In multi-brand SaaS mode this will loop over all active brands.
+    In multi-brand SaaS mode this will loop over all active brands from DB.
     For now it uses the single BRAND_ID from env.
     """
     brand_id   = os.getenv("BRAND_ID",   "default-brand")
@@ -245,7 +261,7 @@ def run_scheduled_inventory():
 def run_scheduled_daily():
     """
     Fires daily at 00:05 PKT via Celery beat.
-    Full sweep: inventory + (trend, pricing, restock once agents are built).
+    Full sweep: inventory + pricing (+ trend, restock once agents are built).
     """
     brand_id   = os.getenv("BRAND_ID",   "default-brand")
     brand_name = os.getenv("BRAND_NAME", "FashionOS Brand")
