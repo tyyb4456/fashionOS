@@ -3,22 +3,22 @@ FashionOS Celery Workers
 ========================
 Async task queue that decouples HTTP request handling from agent execution.
 
-Why Celery instead of asyncio directly in FastAPI?
-  - Shopify webhook endpoints must return 200 within 5 seconds or Shopify retries.
-  - Agent runs take 15–90 seconds (multiple Claude calls + MCP round trips).
-  - Celery pushes work to Redis, FastAPI responds immediately, workers execute async.
-  - Built-in retry logic, task history, and failure handling.
+Worker startup (Windows dev):
+  celery -A api.workers.tasks worker --loglevel=info --pool=solo
 
-Task registry:
-  run_agent_pipeline        ← Core task. Receives trigger + payload, runs supervisor.
-  run_scheduled_inventory   ← Celery beat task. Fires every hour.
-  run_scheduled_daily       ← Celery beat task. Fires at midnight PKT.
-
-Worker startup:
-  celery -A api.workers.tasks worker --loglevel=info --concurrency=4
-
-Beat scheduler (for scheduled runs):
+Beat scheduler:
   celery -A api.workers.tasks beat --loglevel=info
+
+DB + asyncpg + Windows design note:
+  The module-level engine in db/session.py uses a connection pool whose
+  asyncpg sockets are bound to the ProactorEventLoop._proactor at creation
+  time. When _run_async() closes a loop, _proactor becomes None — the next
+  task's DB call through the pooled engine hits 'NoneType has no attribute send'.
+
+  Fix: Celery workers bypass the module-level engine entirely. _save_run_to_db()
+  creates a fresh NullPool engine inside the running event loop, uses it, and
+  disposes it. NullPool = no connection reuse = no stale loop references.
+  FastAPI routes continue to use the normal pooled engine via get_session().
 """
 
 import asyncio
@@ -28,67 +28,60 @@ from datetime import datetime, timezone
 from celery import Celery
 from celery.schedules import crontab
 from celery.utils.log import get_task_logger
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from agents.supervisor import make_initial_state, supervisor_graph
 from db import crud
-from db.session import AsyncSessionLocal
 
 
-# ── Celery app setup ──────────────────────────────────────────────────────────
+# ── Celery app ────────────────────────────────────────────────────────────────
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 celery_app = Celery(
     "fashionos",
     broker=REDIS_URL,
-    backend=REDIS_URL.replace("/0", "/1"),   # separate DB for results
+    backend=REDIS_URL.replace("/0", "/1"),
 )
 
 celery_app.conf.update(
-    # Serialization
     task_serializer   = "json",
     result_serializer = "json",
     accept_content    = ["json"],
 
-    # Reliability
-    task_acks_late             = True,   # ack AFTER task completes, not before
-    task_reject_on_worker_lost = True,   # re-queue if worker dies mid-task
-    worker_prefetch_multiplier = 1,      # one task at a time per worker thread
-                                         # (agent tasks are heavy, don't prefetch)
+    task_acks_late             = True,
+    task_reject_on_worker_lost = True,
+    worker_prefetch_multiplier = 1,
 
-    # Result expiry (keep for 24h for dashboard queries)
     result_expires = 86400,
+    timezone       = "Asia/Karachi",
+    enable_utc     = True,
 
-    # Timezone
-    timezone   = "Asia/Karachi",
-    enable_utc = True,
-
-    # ── Beat schedule (periodic tasks) ───────────────────────────────────────
     beat_schedule = {
-        # Hourly inventory sweep — checks stockout risk in real time
         "hourly-inventory-sweep": {
             "task":     "api.workers.tasks.run_scheduled_inventory",
-            "schedule": crontab(minute=0),   # top of every hour
+            "schedule": crontab(minute=0),
         },
-        # Daily full sweep — inventory + pricing (+ trend/restock once built)
         "daily-full-sweep": {
             "task":     "api.workers.tasks.run_scheduled_daily",
-            "schedule": crontab(hour=0, minute=5),   # 00:05 PKT daily
+            "schedule": crontab(hour=0, minute=5),
         },
     },
 )
 
 logger = get_task_logger(__name__)
 
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://fashionos:fashionos_dev@localhost:5432/fashionos",
+)
 
-# ── Helper: run async coroutine in sync Celery context ────────────────────────
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _run_async(coro):
-    """
-    Celery tasks are synchronous. LangGraph graphs are async.
-    This runs the coroutine in a fresh event loop — safe because each
-    Celery worker process has its own isolated execution context.
-    """
+    """Run one coroutine in a fresh event loop. Call exactly once per task."""
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
@@ -96,17 +89,49 @@ def _run_async(coro):
         loop.close()
 
 
+async def _save_run_to_db(summary: dict, result: dict, task_id: str) -> None:
+    """
+    Persists a completed run to PostgreSQL using a fresh NullPool engine.
+
+    Why not use the module-level engine from db/session.py?
+    That engine's asyncpg connections are bound to the ProactorEventLoop._proactor
+    that was active when the pool was created. On Windows, _proactor becomes None
+    when any event loop closes — so pooled connections from a previous loop's
+    lifetime hit 'NoneType has no attribute send' in the next task.
+
+    NullPool creates a fresh connection per session and closes it immediately
+    after — no binding to any particular loop. Slight overhead per write
+    is irrelevant at one DB write per 15-90 second agent run.
+    """
+    engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
+    Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    try:
+        async with Session() as session:
+            async with session.begin():
+                await crud.save_run(session, summary, result)
+        logger.info(f"[{task_id}] DB: Run persisted (run_id={summary['run_id']}).")
+    except Exception as db_exc:
+        logger.error(
+            f"[{task_id}] DB: Persist failed (non-fatal) — {db_exc}",
+            exc_info=True,
+        )
+        # Never re-raise — a DB hiccup must not retry the entire agent pipeline.
+    finally:
+        await engine.dispose()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TASK 1 — run_agent_pipeline  (core task — all triggers land here)
+# TASK 1 — run_agent_pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
 @celery_app.task(
     name="api.workers.tasks.run_agent_pipeline",
     bind=True,
     max_retries=3,
-    default_retry_delay=30,   # wait 30s before retry
-    soft_time_limit=300,      # warn after 5 min
-    time_limit=420,           # hard kill after 7 min
+    default_retry_delay=30,
+    soft_time_limit=300,
+    time_limit=420,
 )
 def run_agent_pipeline(
     self,
@@ -116,24 +141,6 @@ def run_agent_pipeline(
     trigger_payload: dict,
     agents_to_run:   list | None = None,
 ):
-    """
-    Main entry point for all agent runs.
-
-    Called by:
-      - Shopify webhook handler (orders/paid, inventory_levels/update, etc.)
-      - Scheduled beat tasks (run_scheduled_inventory, run_scheduled_daily)
-      - Manual API endpoint (POST /api/v1/webhooks/manual-run)
-
-    Args:
-        brand_id:        Brand identifier (multi-tenancy key).
-        brand_name:      Human-readable brand name (used in agent prompts).
-        trigger:         "shopify_webhook" | "scheduled_run" | "manual"
-        trigger_payload: Raw webhook body or schedule config dict.
-        agents_to_run:   Optional explicit list for manual triggers.
-
-    Returns:
-        dict with run_id, run_summary, completed_agents, alert counts.
-    """
     task_id = self.request.id
     started = datetime.now(timezone.utc).isoformat()
 
@@ -151,43 +158,54 @@ def run_agent_pipeline(
             agents_to_run   = agents_to_run,
         )
 
-        # ── Run the full supervisor graph ─────────────────────────────────────
-        result = _run_async(supervisor_graph.ainvoke(initial_state))
+        async def _run_pipeline_and_save():
+            # ── Step 1: run the supervisor graph ──────────────────────────────
+            result = await supervisor_graph.ainvoke(initial_state)
 
-        # ── Build return payload ──────────────────────────────────────────────
-        alerts   = result.get("alerts", [])
-        critical = [a for a in alerts if a.get("level") == "critical"]
-        warnings = [a for a in alerts if a.get("level") == "warning"]
+            # ── Step 2: build summary ─────────────────────────────────────────
+            alerts        = result.get("alerts", [])
+            critical      = [a for a in alerts if a.get("level") == "critical"]
+            warnings      = [a for a in alerts if a.get("level") == "warning"]
+            pricing       = result.get("pricing_recommendations", [])
+            auto_priced   = [
+                p for p in pricing
+                if p.get("action") == "markdown" and p.get("discount_pct", 0) <= 15
+            ]
+            pending_price = [
+                p for p in pricing
+                if p.get("action") in ("markdown", "clearance_code", "increase", "bundle")
+                and p.get("discount_pct", 0) > 15
+            ]
 
-        pricing      = result.get("pricing_recommendations", [])
-        auto_priced  = [p for p in pricing if p.get("action") == "markdown"
-                        and p.get("discount_pct", 0) <= 15]
-        pending_price = [p for p in pricing if p.get("action")
-                        in ("markdown", "clearance_code", "increase", "bundle")
-                        and p.get("discount_pct", 0) > 15]
+            summary = {
+                "run_id":           result.get("run_id", initial_state["run_id"]),
+                "brand_id":         brand_id,
+                "brand_name":       brand_name,
+                "trigger":          trigger,
+                "started_at":       started,
+                "completed_at":     result.get("completed_at"),
+                "completed_agents": result.get("completed_agents", []),
+                "run_summary":      result.get("run_summary", ""),
+                "alert_counts": {
+                    "critical": len(critical),
+                    "warning":  len(warnings),
+                    "total":    len(alerts),
+                },
+                "inventory_skus_analysed": len(result.get("inventory_snapshot", [])),
+                "pricing": {
+                    "total_decisions":  len(pricing),
+                    "auto_executed":    len(auto_priced),
+                    "pending_approval": len(pending_price),
+                },
+                "task_id": task_id,
+            }
 
-        summary = {
-            "run_id":           result.get("run_id", initial_state["run_id"]),
-            "brand_id":         brand_id,
-            "brand_name":       brand_name,
-            "trigger":          trigger,
-            "started_at":       started,
-            "completed_at":     result.get("completed_at"),
-            "completed_agents": result.get("completed_agents", []),
-            "run_summary":      result.get("run_summary", ""),
-            "alert_counts": {
-                "critical": len(critical),
-                "warning":  len(warnings),
-                "total":    len(alerts),
-            },
-            "inventory_skus_analysed": len(result.get("inventory_snapshot", [])),
-            "pricing": {
-                "total_decisions":  len(pricing),
-                "auto_executed":    len(auto_priced),
-                "pending_approval": len(pending_price),
-            },
-            "task_id": task_id,
-        }
+            # ── Step 3: persist with a fresh NullPool engine ──────────────────
+            await _save_run_to_db(summary, result, task_id)
+
+            return result, summary
+
+        result, summary = _run_async(_run_pipeline_and_save())
 
         logger.info(
             f"[{task_id}] ✓ Pipeline complete | "
@@ -195,55 +213,22 @@ def run_agent_pipeline(
             f"alerts={summary['alert_counts']}"
         )
 
-        # ── Persist to PostgreSQL ─────────────────────────────────────────────
-        # DB failure is non-fatal: the pipeline already completed successfully.
-        # Log the error but do NOT re-raise — that would trigger a full retry
-        # of the entire agent pipeline just to fix a DB write, which is wrong.
-        async def _save_to_db():
-            async with AsyncSessionLocal() as session:
-                async with session.begin():
-                    await crud.save_run(session, summary, result)
-
-        try:
-            _run_async(_save_to_db())
-            logger.info(f"[{task_id}] DB: Run persisted (run_id={summary['run_id']}).")
-        except Exception as db_exc:
-            logger.error(
-                f"[{task_id}] DB: Persist failed (non-fatal) — {db_exc}",
-                exc_info=True,
-            )
-
-        # ── TODO: push critical alerts to notify-mcp (Twilio WhatsApp) ───────
-        # if critical:
-        #     notify_task.delay(brand_id, critical)
-
         return summary
 
     except Exception as exc:
         logger.error(f"[{task_id}] ✗ Pipeline failed: {exc}", exc_info=True)
-
-        # Retry with exponential backoff — Celery handles the delay
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TASK 2 — Scheduled hourly inventory sweep
+# TASK 2 — Hourly inventory sweep
 # ══════════════════════════════════════════════════════════════════════════════
 
 @celery_app.task(name="api.workers.tasks.run_scheduled_inventory")
 def run_scheduled_inventory():
-    """
-    Fires every hour via Celery beat.
-    Runs inventory agent only — fast, targeted stockout monitoring.
-
-    In multi-brand SaaS mode this will loop over all active brands from DB.
-    For now it uses the single BRAND_ID from env.
-    """
     brand_id   = os.getenv("BRAND_ID",   "default-brand")
     brand_name = os.getenv("BRAND_NAME", "FashionOS Brand")
-
     logger.info(f"[beat] Hourly inventory sweep for brand={brand_name}")
-
     run_agent_pipeline.delay(
         brand_id        = brand_id,
         brand_name      = brand_name,
@@ -259,19 +244,12 @@ def run_scheduled_inventory():
 
 @celery_app.task(name="api.workers.tasks.run_scheduled_daily")
 def run_scheduled_daily():
-    """
-    Fires daily at 00:05 PKT via Celery beat.
-    Full sweep: inventory + pricing (+ trend, restock once agents are built).
-    """
     brand_id   = os.getenv("BRAND_ID",   "default-brand")
     brand_name = os.getenv("BRAND_NAME", "FashionOS Brand")
-
     logger.info(f"[beat] Daily full sweep for brand={brand_name}")
-
     run_agent_pipeline.delay(
         brand_id        = brand_id,
         brand_name      = brand_name,
         trigger         = "scheduled_run",
         trigger_payload = {"schedule_type": "daily"},
-        # No agents_to_run — supervisor's routing table decides
     )

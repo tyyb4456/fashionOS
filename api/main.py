@@ -3,10 +3,18 @@ FashionOS — FastAPI Application
 ================================
 Entry point for the HTTP layer. Mounts all routers and exposes:
 
-  GET  /health          ← Docker + load balancer health check
-  GET  /api/v1/status   ← Richer status (Redis, Celery worker ping)
-  POST /api/v1/webhooks/shopify/{topic}    ← Shopify webhook receiver
-  POST /api/v1/webhooks/manual-run         ← Manual pipeline trigger
+  GET  /health                                  ← Docker + load balancer health check
+  GET  /api/v1/status                           ← Richer status (Redis, agent registry)
+  POST /api/v1/webhooks/shopify/{topic}         ← Shopify webhook receiver
+  POST /api/v1/webhooks/manual-run              ← Manual pipeline trigger
+  GET  /api/v1/runs                             ← Run history list
+  GET  /api/v1/runs/{run_id}                    ← Run detail with child records
+  GET  /api/v1/runs/{run_id}/inventory          ← Inventory snapshots for a run
+  GET  /api/v1/alerts/critical                  ← Open critical alerts
+  GET  /api/v1/pricing/pending                  ← Pricing decisions awaiting approval
+  GET  /api/v1/restock/pending                  ← Restock orders awaiting approval
+  GET  /api/v1/skus/{sku}/history               ← Time-series inventory for a SKU
+  GET  /api/v1/dashboard                        ← Aggregated dashboard summary
 
 Start (dev):
   uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
@@ -18,16 +26,15 @@ Start (prod — via docker-compose):
 import os
 from contextlib import asynccontextmanager
 
-
 from dotenv import load_dotenv
 load_dotenv()   # load .env BEFORE any router modules read os.getenv()
-
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routers import webhooks
+from api.routers import runs
 
 
 # ── App metadata ──────────────────────────────────────────────────────────────
@@ -37,12 +44,13 @@ BRAND_NAME  = os.getenv("BRAND_NAME", "FashionOS Brand")
 ENV         = os.getenv("ENV", "development")
 REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# ── Lifespan: startup + shutdown hooks ───────────────────────────────────────
+
+# ── Lifespan: startup + shutdown hooks ────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Runs once at startup, then yields, then runs at shutdown.
+    Runs once at startup, yields, then runs at shutdown.
     Use for: connection pool setup, warm-up calls, graceful teardown.
     """
     # ── Startup ───────────────────────────────────────────────────────────────
@@ -53,13 +61,9 @@ async def lifespan(app: FastAPI):
         r = aioredis.from_url(REDIS_URL, socket_connect_timeout=3)
         await r.ping()
         await r.aclose()
-        print(f"[FashionOS]  Redis connected ({REDIS_URL})")
+        print(f"[FashionOS] ✓ Redis connected ({REDIS_URL})")
     except Exception as e:
-        # Non-fatal at startup — Celery tasks will fail gracefully if Redis is down
-        print(f"[FashionOS] △  Redis not reachable at startup: {e}")
-
-    # TODO: init PostgreSQL connection pool (SQLAlchemy async engine)
-    # TODO: run Alembic migrations on startup (dev only)
+        print(f"[FashionOS] △ Redis not reachable at startup: {e}")
 
     yield
 
@@ -73,16 +77,15 @@ app = FastAPI(
     title       = f"FashionOS API — {BRAND_NAME}",
     description = (
         "Autonomous multi-agent fashion brand operating system. "
-        "This API receives Shopify webhooks, triggers agent pipelines, "
-        "and exposes run status + results."
+        "Receives Shopify webhooks, triggers agent pipelines, "
+        "and exposes run history, approval queues, and dashboard data."
     ),
     version  = APP_VERSION,
-    docs_url = "/docs" if ENV == "development" else None,   # hide swagger in prod
+    docs_url = "/docs" if ENV == "development" else None,
     lifespan = lifespan,
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# In prod: replace "*" with your actual dashboard domain
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"] if ENV == "development" else [os.getenv("DASHBOARD_URL", "")],
@@ -93,10 +96,10 @@ app.add_middleware(
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(webhooks.router)
+app.include_router(runs.router)
 
 # TODO: add as built
-# from api.routers import runs, alerts, dashboard
-# app.include_router(runs.router)
+# from api.routers import alerts, dashboard
 # app.include_router(alerts.router)
 
 
@@ -108,11 +111,11 @@ async def health():
     return {"status": "ok", "version": APP_VERSION}
 
 
-@app.get("/api/v1/status", tags=["ops"], summary="Richer system status")
-async def status():
+@app.get("/api/v1/status", tags=["ops"], summary="System status")
+async def system_status():
     """
     Checks Redis connectivity and returns system info.
-    Used by the dashboard to show a live "system healthy" indicator.
+    Used by the dashboard to show a live 'system healthy' indicator.
     """
     redis_ok = False
     try:
@@ -124,20 +127,19 @@ async def status():
         pass
 
     return {
-        "status":     "ok" if redis_ok else "degraded",
-        "version":    APP_VERSION,
-        "brand":      BRAND_NAME,
-        "env":        ENV,
-        "redis":      "connected" if redis_ok else "unreachable",
-        "celery":     "not checked",   # TODO: ping Celery inspect
+        "status":  "ok" if redis_ok else "degraded",
+        "version": APP_VERSION,
+        "brand":   BRAND_NAME,
+        "env":     ENV,
+        "redis":   "connected" if redis_ok else "unreachable",
         "agents": {
-            "inventory":  "active",
-            "trend":      "coming soon",
-            "pricing":    "coming soon",
-            "restock":    "coming soon",
-            "content":    "coming soon",
-            "marketing":  "coming soon",
-            "dm":         "coming soon",
-            "returns":    "coming soon",
+            "inventory": "active",
+            "pricing":   "active",
+            "restock":   "active",
+            "trend":     "coming soon",
+            "content":   "coming soon",
+            "marketing": "coming soon",
+            "dm":        "coming soon",
+            "returns":   "coming soon",
         },
     }
