@@ -1,0 +1,4 @@
+fastmcp
+pytrends
+pandas
+python-dotenv

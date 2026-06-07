@@ -2,25 +2,27 @@
 # FashionOS — Local Development Stack
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Brings up:  PostgreSQL · Redis · ChromaDB · shopify-mcp
+# Brings up:  PostgreSQL · Redis · ChromaDB · shopify-mcp · social-mcp · trends-mcp
 #
 # Quick start:
-#   cp .env.example .env && nano .env          ← fill in your Shopify creds
-#   cp mcp_servers/shopify_mcp/.env.example mcp_servers/shopify_mcp/.env
-#   docker compose up -d                       ← start everything
-#   docker compose logs -f shopify-mcp         ← check MCP server is alive
-#   docker compose down -v                     ← nuke volumes (fresh start)
+#   cp .env.example .env && nano .env
+#   cp mcp_servers/shopify_mcp/.env.example  mcp_servers/shopify_mcp/.env
+#   cp mcp_servers/social_mcp/.env.example   mcp_servers/social_mcp/.env
+#   cp mcp_servers/trends_mcp/.env.example   mcp_servers/trends_mcp/.env
+#   docker compose up -d
+#   docker compose logs -f social-mcp trends-mcp
+#   docker compose down -v    ← nuke volumes (fresh start)
 #
-# Ports used:
+# Ports:
 #   5432  → PostgreSQL
 #   6379  → Redis
 #   8000  → ChromaDB
-#   8001  → shopify-mcp   (BUILT)
-#   8002  → social-mcp    (TODO — Apify TikTok/IG)
-#   8003  → trends-mcp    (TODO — Pytrends)
-#   8004  → ads-mcp       (TODO — Meta Marketing API)
-#   8005  → notify-mcp    (TODO — Twilio + Resend)
-#   8080  → FastAPI app   (TODO — uncomment when api/ is built)
+#   8001  → shopify-mcp  (Shopify Admin API)
+#   8002  → social-mcp   (Apify TikTok + Instagram)
+#   8003  → trends-mcp   (Pytrends Google Trends)
+#   8004  → ads-mcp      (TODO — Meta Marketing API)
+#   8005  → notify-mcp   (TODO — Twilio + Resend)
+#   8080  → FastAPI app  (TODO — uncomment when running)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 services:
@@ -90,12 +92,10 @@ services:
       dockerfile: Dockerfile
     container_name: fashionos_shopify_mcp
     restart: unless-stopped
-    # Loads SHOPIFY_SHOP_NAME + SHOPIFY_ACCESS_TOKEN from its own .env file
     env_file: ./mcp_servers/shopify_mcp/.env
     ports:
       - "8001:8001"
     healthcheck:
-      # Checks the port is accepting connections (FastMCP SSE endpoint)
       test:
         - "CMD-SHELL"
         - >
@@ -112,16 +112,60 @@ services:
       retries: 5
       start_period: 15s
 
-  # social-mcp:
-  #   build: { context: ./mcp_servers/social_mcp, dockerfile: Dockerfile }
-  #   container_name: fashionos_social_mcp
-  #   env_file: ./mcp_servers/social_mcp/.env
-  #   ports: ["8002:8002"]
+  social-mcp:
+    build:
+      context:    ./mcp_servers/social_mcp
+      dockerfile: Dockerfile
+    container_name: fashionos_social_mcp
+    restart: unless-stopped
+    env_file: ./mcp_servers/social_mcp/.env
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          python -c "
+          import socket, sys;
+          s = socket.socket();
+          s.settimeout(3);
+          s.connect(('localhost', 8002));
+          s.close();
+          sys.exit(0)
+          "
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
-  # trends-mcp:
-  #   build: { context: ./mcp_servers/trends_mcp, dockerfile: Dockerfile }
-  #   container_name: fashionos_trends_mcp
-  #   ports: ["8003:8003"]
+  trends-mcp:
+    build:
+      context:    ./mcp_servers/trends_mcp
+      dockerfile: Dockerfile
+    container_name: fashionos_trends_mcp
+    restart: unless-stopped
+    # trends-mcp has no secrets — env_file is optional
+    # env_file: ./mcp_servers/trends_mcp/.env
+    environment:
+      TRENDS_DEFAULT_GEO: PK
+    ports:
+      - "8003:8003"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          python -c "
+          import socket, sys;
+          s = socket.socket();
+          s.settimeout(3);
+          s.connect(('localhost', 8003));
+          s.close();
+          sys.exit(0)
+          "
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # ads-mcp:
   #   build: { context: ./mcp_servers/ads_mcp, dockerfile: Dockerfile }
@@ -144,11 +188,13 @@ services:
   #   env_file: .env
   #   ports: ["8080:8080"]
   #   volumes:
-  #     - .:/app                          # live reload in dev
+  #     - .:/app
   #   depends_on:
   #     postgres:    { condition: service_healthy }
   #     redis:       { condition: service_healthy }
   #     shopify-mcp: { condition: service_healthy }
+  #     social-mcp:  { condition: service_healthy }
+  #     trends-mcp:  { condition: service_healthy }
 
   # fashionos-worker:
   #   build: { context: ., dockerfile: Dockerfile }
@@ -157,19 +203,6 @@ services:
   #   env_file: .env
   #   depends_on:
   #     redis:    { condition: service_healthy }
-  #     postgres: { condition: service_healthy }
-
-  # ── OBSERVABILITY — Uncomment for trace monitoring ────────────────────────────
-
-  # langfuse:
-  #   image: langfuse/langfuse:latest
-  #   container_name: fashionos_langfuse
-  #   ports: ["3000:3000"]
-  #   environment:
-  #     DATABASE_URL: postgresql://fashionos:${POSTGRES_PASSWORD:-fashionos_dev}@postgres/fashionos
-  #     NEXTAUTH_SECRET: ${LANGFUSE_SECRET:-dev-secret-change-in-prod}
-  #     NEXTAUTH_URL: http://localhost:3000
-  #   depends_on:
   #     postgres: { condition: service_healthy }
 
 # ── VOLUMES ───────────────────────────────────────────────────────────────────

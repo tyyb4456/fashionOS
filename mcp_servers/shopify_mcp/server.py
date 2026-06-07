@@ -418,7 +418,7 @@ async def create_restock_recommendation(
         "reason":                  reason,
         "supplier_message":        supplier_message,
         "status":                  "pending_approval",
-        "created_at":              datetime.utcnow().isoformat() + "Z",
+        "created_at":              datetime.now().isoformat() + "Z",
     }
 
 
