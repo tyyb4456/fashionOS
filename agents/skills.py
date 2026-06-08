@@ -5,9 +5,6 @@ Each skill is a specialized prompt + context block that an agent loads
 on-demand via load_skill(). This follows the LangChain Skills pattern:
 progressive disclosure of domain knowledge without bloating the base
 system prompt.
-
-Skills are stored as plain strings here. In production these can be
-loaded from a database or file system.
 """
 
 SKILLS: dict[str, str] = {
@@ -122,10 +119,81 @@ You are now loaded with specialized knowledge for fashion content generation.
 - Always mention at least one specific: fabric, cut, or occasion
 - Urgency is real, not fake: "Limited stock" only if Inventory Agent confirms < 20 units
 
-### Optimal posting times (Pakistan, IST)
+### Optimal posting times (Pakistan, PKT)
 - Instagram: 8-9 PM daily (highest engagement window)
 - TikTok: 7-9 PM daily
 - Stories: 12-1 PM (lunchtime scroll) and 8-10 PM
+""",
+
+    "fashion_returns": """
+## Fashion Returns Intelligence Skill
+
+You are now loaded with specialized knowledge for fashion returns analysis.
+
+### Return reason taxonomy
+Cluster raw customer return reason text into ONE of these categories:
+
+- **size_issue**: "too big", "too small", "sizing off", "runs large/small", "didn't fit",
+  "size chart wrong"
+  → Fix: Add precise cm/inch measurements to size guide. Add fit notes (e.g. "slim fit —
+    size up if between sizes"). Photograph the garment flat with a ruler for scale.
+
+- **description_mismatch**: "not as described", "color looks different in person",
+  "fabric not what I expected", "different from photo", "color inaccurate on screen"
+  → Fix: Reshoot product in natural outdoor light. Add color accuracy disclaimer.
+    Add exact fabric composition + weight (grams per sqm) to description.
+
+- **quality_issue**: "poor stitching", "bad quality fabric", "zipper broke on first wear",
+  "color faded after one wash", "threading loose", "fell apart"
+  → Fix: Flag supplier for quality review. Request a production batch hold.
+    Consider removing the product until quality is resolved.
+
+- **changed_mind**: "ordered by mistake", "didn't like how it looked on me",
+  "found cheaper elsewhere", "gifted already have it", "no longer needed"
+  → Fix: Monitor — high changed_mind may mean misleading marketing or impulse purchases.
+    Consider adding more accurate lifestyle shots.
+
+- **late_delivery**: "arrived too late for Eid", "wedding passed already",
+  "needed for a specific event"
+  → Fix: Add occasion-specific delivery warnings (e.g. "Order 7 days before your event").
+    Show estimated delivery prominently on the product page.
+
+- **duplicate_order**: "ordered twice by accident", "double charged"
+  → Fix: No product fix needed. Review checkout UX or payment confirmation flow.
+
+- **other**: anything that doesn't fit above categories clearly.
+
+### Return rate thresholds (Pakistani fashion context)
+Calculate: return_rate_pct = (total_units_returned / estimated_30d_sales) × 100
+Where estimated_30d_sales = units_per_day × 30 (from Inventory Agent data if available).
+
+- < 5%:  **healthy** — no action, just monitor
+- 5-10%: **info** — log the reason, low priority fix
+- 10-15%: **warning** — fix needed within 2 weeks
+- > 15%: **critical** — immediate action, high revenue impact
+
+If sales data is unavailable, use ABSOLUTE RETURN COUNTS as a proxy:
+- < 3 units returned in 30 days: healthy
+- 3-5 units: info
+- 6-10 units: warning
+- > 10 units: critical
+
+### Pakistani fashion-specific return patterns
+- Size guide issues are the #1 cause of returns in Pakistani fashion (60%+ of returns)
+  — because most local brands don't provide cm measurements, only S/M/L labels
+- Lawn and chiffon fabric returns spike in summer — customers expect specific drape/weight
+  — fix: add fabric weight (grams per sqm) and drape description
+- Color accuracy is a persistent problem — phone screens render fabric colors inaccurately
+  — fix: outdoor natural light photos + color disclaimer in listing
+- Returns for "changed mind" spike 2 weeks after Eid sales — impulse buys coming back
+  — this is seasonal, not a product fix issue
+
+### Fix priority by ROI
+1. Size guide table with cm + inches → reduces size_issue returns ~40%
+2. Natural light / accurate color photos → reduces description_mismatch ~30%
+3. Fabric weight + feel description → reduces expectation mismatch ~20%
+4. Occasion delivery warnings → reduces late_delivery returns ~60%
+5. Supplier quality review → required for quality_issue patterns
 """,
 
 }
@@ -141,6 +209,7 @@ def load_skill(skill_name: str) -> str:
     - fashion_trend      : TikTok/IG trend signals, trend lifecycle, PK market context
     - fashion_pricing    : Markdown strategy, margin rules, Pakistani price sensitivity
     - fashion_content    : Caption/TikTok script formulas, brand voice, posting times
+    - fashion_returns    : Return reason taxonomy, rate thresholds, PK-specific patterns
     """
     skill = SKILLS.get(skill_name)
     if skill is None:
