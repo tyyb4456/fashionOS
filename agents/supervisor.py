@@ -10,22 +10,26 @@ Execution order (full daily / manual sweep):
     → run_pricing_agent      ← reads trend_signals + inventory_snapshot
     → run_restock_agent      ← reads inventory + pricing
     → run_content_agent      ← reads trend + inventory + pricing
-    → run_returns_agent      ← reads inventory_snapshot for return rate calc (NEW)
+    → run_returns_agent      ← reads inventory_snapshot for return rate calc
+    → run_marketing_agent    ← reads trend + inventory + pricing (NEW session 6)
     → summarize
     → END
 
 Routing table:
-  ┌──────────────────────────────┬──────────────────────────────────────────────────────┐
-  │ Trigger                      │ Agents                                               │
-  ├──────────────────────────────┼──────────────────────────────────────────────────────┤
-  │ shopify_webhook  orders/*    │ inventory → pricing → restock                        │
-  │ shopify_webhook  refunds/*   │ returns   (NEW — real-time on each refund)           │
-  │ shopify_webhook  inventory/* │ inventory                                            │
-  │ shopify_webhook  products/*  │ inventory                                            │
-  │ scheduled_run    hourly      │ inventory                                            │
-  │ scheduled_run    daily       │ inventory→trend→pricing→restock→content→returns      │
-  │ manual                       │ same as daily                                        │
-  └──────────────────────────────┴──────────────────────────────────────────────────────┘
+  ┌──────────────────────────────┬────────────────────────────────────────────────────────────┐
+  │ Trigger                      │ Agents                                                     │
+  ├──────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ shopify_webhook  orders/*    │ inventory → pricing → restock                              │
+  │ shopify_webhook  refunds/*   │ returns   (real-time on each refund)                       │
+  │ shopify_webhook  inventory/* │ inventory                                                  │
+  │ shopify_webhook  products/*  │ inventory                                                  │
+  │ scheduled_run    hourly      │ inventory                                                  │
+  │ scheduled_run    daily       │ inventory→trend→pricing→restock→content→returns→marketing  │
+  │ manual                       │ same as daily (or agents_to_run payload)                   │
+  └──────────────────────────────┴────────────────────────────────────────────────────────────┘
+
+Marketing Agent runs ONLY on daily + manual — NOT on order webhooks.
+Ad budgets don't need per-order updates; running per-order would burn Apify/Meta API quota.
 """
 
 import os
@@ -37,6 +41,7 @@ from langgraph.graph import END, START, StateGraph
 
 from agents.content.graph   import content_graph
 from agents.inventory.graph import inventory_graph
+from agents.marketing.graph import marketing_graph   # NEW session 6
 from agents.pricing.graph   import pricing_graph
 from agents.restock.graph   import restock_graph
 from agents.returns.graph   import returns_graph
@@ -58,9 +63,9 @@ def decide_agents(state: FashionOSState) -> dict:
     Pure routing — no LLM call.
 
     Agent registry:
-      "inventory" ✓  "trend"   ✓  "pricing" ✓
-      "restock"   ✓  "content" ✓  "returns" ✓
-      "marketing" ✗  "dm"      ✗
+      "inventory" ✓  "trend"     ✓  "pricing"   ✓
+      "restock"   ✓  "content"   ✓  "returns"   ✓
+      "marketing" ✓  "dm"        ✗
     """
     trigger         = state.get("trigger", "manual")
     trigger_payload = state.get("trigger_payload", {})
@@ -73,11 +78,10 @@ def decide_agents(state: FashionOSState) -> dict:
             reasoning = (
                 f"Order webhook ({topic}). "
                 "Inventory + pricing + restock. "
-                "Trend/Content/Returns skipped — not needed per-order."
+                "Trend/Content/Returns/Marketing skipped — not needed per-order."
             )
 
         elif topic.startswith("refunds/"):
-            # Real-time returns analysis on every refund event
             agents = ["returns"]
             reasoning = (
                 f"Refund webhook ({topic}). "
@@ -105,11 +109,12 @@ def decide_agents(state: FashionOSState) -> dict:
             reasoning = "Hourly sweep: inventory velocity refresh only."
 
         elif schedule_type == "daily":
-            agents = ["inventory", "trend", "pricing", "restock", "content", "returns"]
+            agents = ["inventory", "trend", "pricing", "restock", "content", "returns", "marketing"]
             reasoning = (
-                "Daily full sweep: all 6 operational agents. "
-                "Order: inventory → trend → pricing → restock → content → returns. "
-                "inventory_snapshot is in state for returns rate calculation."
+                "Daily full sweep: all 7 operational agents. "
+                "Order: inventory → trend → pricing → restock → content → returns → marketing. "
+                "Marketing runs last — needs inventory, trend, and pricing signals. "
+                "Ad budget changes only make sense on the daily cycle, not per-order."
             )
 
         else:
@@ -121,12 +126,12 @@ def decide_agents(state: FashionOSState) -> dict:
         agents = (
             manual_agents
             if manual_agents
-            else ["inventory", "trend", "pricing", "restock", "content", "returns"]
+            else ["inventory", "trend", "pricing", "restock", "content", "returns", "marketing"]
         )
         reasoning = (
             f"Manual trigger. Running: {', '.join(agents)}."
             if manual_agents
-            else "Manual — running full pipeline (all 6 agents)."
+            else "Manual — running full pipeline (all 7 agents)."
         )
 
     else:
@@ -150,7 +155,7 @@ def decide_agents(state: FashionOSState) -> dict:
 async def run_inventory_agent(state: FashionOSState) -> dict:
     """
     Runs Inventory Agent. Propagates products → parent state so
-    Trend, Content, and Returns agents can use catalog + velocity data
+    Trend, Content, Returns, and Marketing agents can use catalog + velocity data
     without redundant MCP calls.
     """
     if "inventory" not in state.get("agents_to_run", []):
@@ -346,8 +351,7 @@ async def run_content_agent(state: FashionOSState) -> dict:
 async def run_returns_agent(state: FashionOSState) -> dict:
     """
     Runs Returns Agent. Calls get_returns via shopify-mcp.
-    Uses inventory_snapshot from state (if present) for return rate calculation.
-    Runs on refunds/* webhooks (real-time) AND daily sweeps.
+    Now writes BOTH state.alerts AND state.return_insights (session 6).
     """
     if "returns" not in state.get("agents_to_run", []):
         return {}
@@ -357,12 +361,13 @@ async def run_returns_agent(state: FashionOSState) -> dict:
     result = await returns_graph.ainvoke({
         "brand_id":           state["brand_id"],
         "brand_name":         state["brand_name"],
-        "inventory_snapshot": state.get("inventory_snapshot", []),  # may be empty on webhook
+        "inventory_snapshot": state.get("inventory_snapshot", []),
         "raw_returns":        [],
         "returns_by_sku":     [],
         "skill_content":      "",
         "raw_analysis":       "",
         "alerts":             [],
+        "return_insights":    [],   # NEW — must be in initial state
     })
 
     critical = [a for a in result["alerts"] if a.get("level") == "critical"]
@@ -371,21 +376,72 @@ async def run_returns_agent(state: FashionOSState) -> dict:
     print(
         f"[Supervisor] ✓ Returns done. "
         f"{len(result['alerts'])} alerts "
-        f"({len(critical)} critical, {len(warnings)} warning)."
+        f"({len(critical)} critical, {len(warnings)} warning), "
+        f"{len(result.get('return_insights', []))} insights."
     )
 
     return {
         "alerts":           result["alerts"],
+        "return_insights":  result.get("return_insights", []),
         "completed_agents": state.get("completed_agents", []) + ["returns"],
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 8 — summarize
+# NODE 8 — run_marketing_agent  (NEW session 6)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_marketing_agent(state: FashionOSState) -> dict:
+    """
+    Runs Marketing Agent. Reads trend + inventory + pricing.
+    Pauses waste, decreases underperforming budgets, queues increases for trending SKUs.
+
+    Runs ONLY on daily + manual (not on order webhooks — ad budgets
+    don't need per-order updates and Meta API calls cost quota).
+    """
+    if "marketing" not in state.get("agents_to_run", []):
+        return {}
+
+    print("[Supervisor] → Dispatching Marketing Agent…")
+
+    result = await marketing_graph.ainvoke({
+        "brand_id":                state["brand_id"],
+        "brand_name":              state["brand_name"],
+        "inventory_snapshot":      state.get("inventory_snapshot", []),
+        "trend_signals":           state.get("trend_signals", []),
+        "pricing_recommendations": state.get("pricing_recommendations", []),
+        "campaigns":               [],
+        "skill_content":           "",
+        "raw_analysis":            "",
+        "marketing_actions":       [],
+        "alerts":                  [],
+    })
+
+    auto_exec = [a for a in result["marketing_actions"] if a.get("auto_executed")]
+    pending   = [a for a in result["marketing_actions"] if not a.get("auto_executed") and a.get("action") != "hold"]
+    paused    = [a for a in result["marketing_actions"] if a.get("action") == "pause"]
+
+    print(
+        f"[Supervisor] ✓ Marketing done. "
+        f"{len(result['marketing_actions'])} decisions: "
+        f"{len(paused)} paused, {len(auto_exec)} auto-executed, "
+        f"{len(pending)} pending approval. "
+        f"{len(result['alerts'])} alerts."
+    )
+
+    return {
+        "marketing_actions": result["marketing_actions"],
+        "alerts":            result["alerts"],
+        "completed_agents":  state.get("completed_agents", []) + ["marketing"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 9 — summarize
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def summarize(state: FashionOSState) -> dict:
-    """Generates run summary. Now includes returns stats."""
+    """Generates run summary. Includes marketing stats (session 6)."""
     completed = state.get("completed_agents", [])
 
     if not completed:
@@ -394,33 +450,39 @@ async def summarize(state: FashionOSState) -> dict:
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    snapshots = state.get("inventory_snapshot", [])
-    alerts    = state.get("alerts", [])
-    pricing   = state.get("pricing_recommendations", [])
-    restocks  = state.get("restock_recommendations", [])
-    trends    = state.get("trend_signals", [])
-    content   = state.get("content_queue", [])
+    snapshots  = state.get("inventory_snapshot", [])
+    alerts     = state.get("alerts", [])
+    pricing    = state.get("pricing_recommendations", [])
+    restocks   = state.get("restock_recommendations", [])
+    trends     = state.get("trend_signals", [])
+    content    = state.get("content_queue", [])
+    marketing  = state.get("marketing_actions", [])
 
-    # Returns alerts (from returns_agent)
+    # Returns alerts
     return_alerts = [
         a for a in alerts
         if a.get("agent") == "returns_agent" and a.get("level") in ("critical", "warning")
     ]
+
+    # Marketing summary
+    campaigns_paused    = [m["sku"] for m in marketing if m.get("action") == "pause" and m.get("sku")]
+    budgets_decreased   = [m for m in marketing if m.get("action") == "decrease_budget" and m.get("auto_executed")]
+    budgets_pending_inc = [m for m in marketing if m.get("action") == "increase_budget"]
 
     run_data = {
         "brand":      state["brand_name"],
         "trigger":    state.get("trigger"),
         "agents_run": completed,
         # Inventory
-        "total_skus":    len(snapshots),
-        "critical_skus": [s["sku"] for s in snapshots if s.get("urgency") == "critical"],
-        "high_risk_skus":[s["sku"] for s in snapshots if s.get("urgency") == "high"],
+        "total_skus":     len(snapshots),
+        "critical_skus":  [s["sku"] for s in snapshots if s.get("urgency") == "critical"],
+        "high_risk_skus": [s["sku"] for s in snapshots if s.get("urgency") == "high"],
         # Trends
         "rising_trends":   [t["keyword"] for t in trends if t.get("direction") == "rising"],
         "catalog_matched": [t["matched_sku"] for t in trends if t.get("matched_sku")],
         # Pricing
-        "markdowns_auto":    len([p for p in pricing if p.get("action") == "markdown" and p.get("discount_pct", 0) <= 15]),
-        "pricing_pending":   len([p for p in pricing if p.get("action") in ("markdown", "clearance_code", "increase", "bundle") and p.get("discount_pct", 0) > 15]),
+        "markdowns_auto":  len([p for p in pricing if p.get("action") == "markdown" and p.get("discount_pct", 0) <= 15]),
+        "pricing_pending": len([p for p in pricing if p.get("action") in ("markdown", "clearance_code", "increase", "bundle") and p.get("discount_pct", 0) > 15]),
         # Restock
         "restock_orders":       len(restocks),
         "total_units_to_order": sum(r.get("recommended_quantity", 0) for r in restocks),
@@ -429,10 +491,14 @@ async def summarize(state: FashionOSState) -> dict:
         "content_posts_generated": len(content),
         "urgent_posts":            len([p for p in content if p.get("is_urgent")]),
         "urgent_post_skus":        [p["sku"] for p in content if p.get("is_urgent")],
-        # Returns (NEW)
-        "return_issues_found":     len(return_alerts),
-        "critical_return_skus":    [a["sku"] for a in return_alerts if a.get("level") == "critical" and a.get("sku")],
-        "warning_return_skus":     [a["sku"] for a in return_alerts if a.get("level") == "warning" and a.get("sku")],
+        # Returns
+        "return_issues_found":  len(return_alerts),
+        "critical_return_skus": [a["sku"] for a in return_alerts if a.get("level") == "critical" and a.get("sku")],
+        # Marketing (NEW)
+        "campaigns_paused":          campaigns_paused,
+        "budgets_auto_decreased":    len(budgets_decreased),
+        "budget_increases_pending":  len(budgets_pending_inc),
+        "pending_increase_skus":     [m.get("sku","") for m in budgets_pending_inc],
         # Overall alerts
         "critical_alerts": len([a for a in alerts if a.get("level") == "critical"]),
         "warning_alerts":  len([a for a in alerts if a.get("level") == "warning"]),
@@ -443,12 +509,12 @@ async def summarize(state: FashionOSState) -> dict:
             "You are writing a brief operational summary for a fashion brand owner. "
             "Direct, specific, action-oriented. 2-4 sentences max. No fluff. "
             "Lead with most urgent item. "
+            "If campaigns were paused, mention which SKUs and why. "
+            "If budget increases are pending, mention which trending SKUs need approval. "
             "If return issues found, mention which SKUs and the fix needed. "
             "If content posts ready, mention which to film today."
         )),
-        HumanMessage(content=(
-            f"Write a run summary for this FashionOS cycle:\n{run_data}"
-        )),
+        HumanMessage(content=f"Write a run summary for this FashionOS cycle:\n{run_data}"),
     ])
 
     summary_text = response.content.strip()
@@ -467,24 +533,26 @@ async def summarize(state: FashionOSState) -> dict:
 def build_supervisor_graph() -> StateGraph:
     graph = StateGraph(FashionOSState)
 
-    graph.add_node("decide_agents",       decide_agents)
-    graph.add_node("run_inventory_agent", run_inventory_agent)
-    graph.add_node("run_trend_agent",     run_trend_agent)
-    graph.add_node("run_pricing_agent",   run_pricing_agent)
-    graph.add_node("run_restock_agent",   run_restock_agent)
-    graph.add_node("run_content_agent",   run_content_agent)
-    graph.add_node("run_returns_agent",   run_returns_agent)
-    graph.add_node("summarize",           summarize)
+    graph.add_node("decide_agents",        decide_agents)
+    graph.add_node("run_inventory_agent",  run_inventory_agent)
+    graph.add_node("run_trend_agent",      run_trend_agent)
+    graph.add_node("run_pricing_agent",    run_pricing_agent)
+    graph.add_node("run_restock_agent",    run_restock_agent)
+    graph.add_node("run_content_agent",    run_content_agent)
+    graph.add_node("run_returns_agent",    run_returns_agent)
+    graph.add_node("run_marketing_agent",  run_marketing_agent)   # NEW session 6
+    graph.add_node("summarize",            summarize)
 
-    graph.add_edge(START,                  "decide_agents")
-    graph.add_edge("decide_agents",        "run_inventory_agent")
-    graph.add_edge("run_inventory_agent",  "run_trend_agent")
-    graph.add_edge("run_trend_agent",      "run_pricing_agent")
-    graph.add_edge("run_pricing_agent",    "run_restock_agent")
-    graph.add_edge("run_restock_agent",    "run_content_agent")
-    graph.add_edge("run_content_agent",    "run_returns_agent")
-    graph.add_edge("run_returns_agent",    "summarize")
-    graph.add_edge("summarize",            END)
+    graph.add_edge(START,                   "decide_agents")
+    graph.add_edge("decide_agents",         "run_inventory_agent")
+    graph.add_edge("run_inventory_agent",   "run_trend_agent")
+    graph.add_edge("run_trend_agent",       "run_pricing_agent")
+    graph.add_edge("run_pricing_agent",     "run_restock_agent")
+    graph.add_edge("run_restock_agent",     "run_content_agent")
+    graph.add_edge("run_content_agent",     "run_returns_agent")
+    graph.add_edge("run_returns_agent",     "run_marketing_agent")   # NEW
+    graph.add_edge("run_marketing_agent",   "summarize")             # NEW
+    graph.add_edge("summarize",             END)
 
     return graph.compile()
 
@@ -524,6 +592,7 @@ def make_initial_state(
         content_queue            = [],
         dm_replies               = [],
         alerts                   = [],
+        return_insights          = [],   # NEW session 6
 
         agents_to_run        = agents_to_run or [],
         completed_agents     = [],

@@ -51,10 +51,39 @@ class RestockRecommendation(TypedDict):
 
 
 class MarketingAction(TypedDict):
-    sku:          str
-    action:       str   # "increase_budget" | "decrease_budget" | "pause" | "activate"
-    reason:       str
-    amount_delta: Optional[float]  # Budget change amount
+    """
+    One budget/status decision per Meta campaign.
+
+    Extended in session 6 to include campaign_id, campaign_name,
+    auto_executed, and trigger — needed for DB persistence and
+    dashboard display without joining against alerts.
+    """
+    sku:           str
+    campaign_id:   str
+    campaign_name: str
+    action:        str   # "hold" | "increase_budget" | "decrease_budget" | "pause" | "activate"
+    reason:        str
+    amount_delta:  Optional[float]  # PKR change in daily budget (positive = increase)
+    auto_executed: bool
+    trigger:       str   # "out_of_stock" | "clearance" | "trending" | "organic_viral" | "low_roas" | "healthy" | "no_sku_match"
+
+
+class ReturnInsightData(TypedDict):
+    """
+    Structured return pattern for one SKU — written by Returns Agent in session 6.
+    Enables DB persistence in return_insights table and structured dashboard display.
+    Previously, only alerts were written (text-only); this adds the structured form.
+    """
+    sku:                   str
+    product_title:         str
+    total_returns:         int
+    total_units_returned:  int
+    primary_reason:        str   # see fashion_returns skill for taxonomy
+    return_rate_pct:       Optional[float]
+    estimated_30d_sales:   Optional[int]
+    severity:              str   # "critical" | "warning" | "info"
+    recommended_fix:       str
+    fix_type:              str   # "update_size_guide" | "update_photos" | etc.
 
 
 class AgentAlert(TypedDict):
@@ -95,6 +124,12 @@ class FashionOSState(TypedDict):
     content_queue:              Annotated[list[dict], operator.add]  # Posts to schedule
     dm_replies:                 Annotated[list[dict], operator.add]  # Auto-replies sent
     alerts:                     Annotated[list[AgentAlert], operator.add]
+
+    # ── Returns structured output (session 6 — alongside alerts) ──────────────
+    # Returns Agent now writes both:
+    #   state.alerts         → text alerts surfaced in dashboard notifications
+    #   state.return_insights → structured data persisted in return_insights table
+    return_insights: Annotated[list[ReturnInsightData], operator.add]
 
     # ── Supervisor routing ────────────────────────────────────────────────────
     agents_to_run:       list[str]   # Which agents the supervisor decided to activate

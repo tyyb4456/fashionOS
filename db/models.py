@@ -4,22 +4,20 @@ FashionOS Database Models
 SQLAlchemy 2.0 ORM models. One row-set per agent run.
 
 Tables:
-  agent_runs                 ← One row per supervisor run (the top-level record)
+  agent_runs                 ← One row per supervisor run (top-level record)
   inventory_snapshots        ← Per-SKU snapshot written by Inventory Agent
   pricing_actions            ← Per-SKU decision written by Pricing Agent
   alerts                     ← All agent alerts (merged from all agents)
-  restock_recommendations    ← Pending restock orders (pre-wired for Restock Agent)
+  restock_recommendations    ← Pending restock orders
+  marketing_actions          ← Per-campaign budget decisions (NEW session 6)
+  content_posts              ← Generated Instagram + TikTok content (NEW session 6)
+  return_insights            ← Structured return patterns (NEW session 6)
 
-Design decisions:
-  - UUID primary keys on all tables — safe for distributed workers, no hot spots.
-  - `run_id` (string, from FashionOSState) is the join key across all tables.
-    Kept as VARCHAR(36) so it's human-readable in logs and matches the state field type.
-  - Cached aggregate counts on `agent_runs` (alert_count_*, pricing_*) mean the
-    dashboard list view never needs to JOIN — cheap to render run history at scale.
-  - `restock_recommendations` table is pre-created now even though the Restock Agent
-    isn't built yet — schema change without data migration later.
-  - No FK constraints in DB — run_id is the logical FK but we skip the physical one
-    to avoid cascade complexity during development. Add in production if needed.
+Session 6 additions:
+  - MarketingActionRecord  — persists Marketing Agent campaign decisions
+  - ContentPostRecord      — persists Content Agent content_queue items
+  - ReturnInsightRecord    — persists Returns Agent structured patterns
+  - AgentRun gains 3 new cached aggregate columns for marketing stats
 """
 
 import uuid
@@ -42,39 +40,29 @@ class Base(DeclarativeBase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AgentRun(Base):
-    """
-    One row per supervisor pipeline invocation.
-
-    Contains cached aggregate counts so dashboard queries never need to JOIN.
-    Full per-SKU data lives in the child tables below.
-    """
+    """One row per supervisor pipeline invocation."""
     __tablename__ = "agent_runs"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    # run_id comes from FashionOSState — a UUID string generated at pipeline start.
     run_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False, index=True)
 
-    # ── Identity ──────────────────────────────────────────────────────────────
     brand_id:   Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     brand_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    # ── Trigger context ───────────────────────────────────────────────────────
     trigger:         Mapped[str]            = mapped_column(String(50), nullable=False)
     trigger_payload: Mapped[Optional[Any]]  = mapped_column(JSON, nullable=True)
     task_id:         Mapped[Optional[str]]  = mapped_column(String(255), nullable=True)
 
-    # ── Timing ────────────────────────────────────────────────────────────────
     started_at:   Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    # ── Run metadata ──────────────────────────────────────────────────────────
-    agents_run:           Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)    # list[str]
+    agents_run:           Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
     run_summary:          Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     supervisor_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # ── Cached aggregate counts (for fast dashboard list view) ─────────────────
+    # Cached aggregate counts — fast dashboard list view without JOINs
     alert_count_critical:     Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     alert_count_warning:      Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     alert_count_total:        Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -85,41 +73,35 @@ class AgentRun(Base):
     pricing_auto_executed:    Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     pricing_pending_approval: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # ── Row timestamp ─────────────────────────────────────────────────────────
+    # Marketing cached counts (NEW session 6)
+    marketing_decisions_total:  Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    marketing_auto_executed:    Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    marketing_pending_approval: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# inventory_snapshots  — per-SKU row written by Inventory Agent
+# inventory_snapshots
 # ══════════════════════════════════════════════════════════════════════════════
 
 class InventorySnapshotRecord(Base):
-    """
-    One row per SKU per run. Maps to FashionOSState.inventory_snapshot[].
-    Sorted by days_of_stock_remaining for display (most urgent first).
-    """
     __tablename__ = "inventory_snapshots"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    run_id:   Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
     brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
-    # ── SKU data ──────────────────────────────────────────────────────────────
     sku:           Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     product_title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     variant_title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
-    # ── Stock metrics ─────────────────────────────────────────────────────────
     current_stock:           Mapped[int]   = mapped_column(Integer, nullable=False, default=0)
     units_per_day:           Mapped[float] = mapped_column(Float,   nullable=False, default=0.0)
     days_of_stock_remaining: Mapped[float] = mapped_column(Float,   nullable=False, default=999.0)
 
-    # ── Classification ────────────────────────────────────────────────────────
-    # "critical" | "high" | "normal" | "healthy"
     urgency: Mapped[str] = mapped_column(String(20), nullable=False, default="healthy")
 
     created_at: Mapped[datetime] = mapped_column(
@@ -128,29 +110,19 @@ class InventorySnapshotRecord(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# pricing_actions  — per-SKU decision written by Pricing Agent
+# pricing_actions
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PricingActionRecord(Base):
-    """
-    One row per SKU per run, including "hold" decisions.
-    auto_executed=True  → already applied in Shopify via MCP.
-    auto_executed=False + action != 'hold' → pending in dashboard for human approval.
-    """
     __tablename__ = "pricing_actions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    run_id:   Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
     brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
-    # ── SKU identity ──────────────────────────────────────────────────────────
     sku:        Mapped[str]           = mapped_column(String(255), nullable=False, index=True)
     variant_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
-    # ── Decision ──────────────────────────────────────────────────────────────
-    # "hold" | "markdown" | "increase" | "clearance_code" | "bundle"
     action:            Mapped[str]   = mapped_column(String(30),  nullable=False)
     current_price:     Mapped[float] = mapped_column(Float,       nullable=False, default=0.0)
     recommended_price: Mapped[float] = mapped_column(Float,       nullable=False, default=0.0)
@@ -164,65 +136,175 @@ class PricingActionRecord(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# alerts  — all agent alerts merged per run
+# alerts
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AlertRecord(Base):
-    """
-    All alerts raised by any agent during a run.
-    Uses the created_at from the alert itself (not server default) to preserve
-    the original agent timestamp.
-    """
     __tablename__ = "alerts"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    run_id:   Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
     brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
-    # "critical" | "warning" | "info"
     level: Mapped[str] = mapped_column(String(20),  nullable=False, index=True)
     agent: Mapped[str] = mapped_column(String(100), nullable=False)
 
     message: Mapped[str]           = mapped_column(Text,       nullable=False)
     sku:     Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    # Use the timestamp set by the agent, not server_default
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# restock_recommendations  — pre-wired for Restock Agent (not yet built)
+# restock_recommendations
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RestockRecommendationRecord(Base):
-    """
-    Pending restock orders produced by the Restock Agent.
-    Status starts as "pending_approval". Dashboard shows these for human review.
-    No auto-ordering — always requires explicit human approval.
-    """
     __tablename__ = "restock_recommendations"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    run_id:   Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
     brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
     sku: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
-    # ── Order details ─────────────────────────────────────────────────────────
-    recommended_quantity:    Mapped[int]   = mapped_column(Integer, nullable=False, default=0)
+    recommended_quantity:    Mapped[int]   = mapped_column(Integer,    nullable=False, default=0)
     urgency:                 Mapped[str]   = mapped_column(String(20), nullable=False)
-    days_of_stock_remaining: Mapped[float] = mapped_column(Float, nullable=False)
-    units_per_day:           Mapped[float] = mapped_column(Float, nullable=False)
+    days_of_stock_remaining: Mapped[float] = mapped_column(Float,      nullable=False)
+    units_per_day:           Mapped[float] = mapped_column(Float,      nullable=False)
 
     reason:           Mapped[str] = mapped_column(Text, nullable=False, default="")
     supplier_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
-    # "pending_approval" | "approved" | "ordered" | "cancelled"
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending_approval")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# marketing_actions  — NEW session 6
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MarketingActionRecord(Base):
+    """
+    One row per Meta campaign per run.
+    Persists the full decision including auto-executed budget changes
+    and pending-approval increases. Enables the dashboard's Marketing tab:
+    campaign spend history, budget change log, pending approvals.
+    """
+    __tablename__ = "marketing_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
+    brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    # Campaign identity
+    sku:           Mapped[Optional[str]] = mapped_column(String(255), nullable=True,  index=True)
+    campaign_id:   Mapped[str]           = mapped_column(String(255), nullable=False, index=True)
+    campaign_name: Mapped[str]           = mapped_column(String(500), nullable=False)
+
+    # Decision
+    # "hold" | "increase_budget" | "decrease_budget" | "pause" | "activate"
+    action:              Mapped[str]           = mapped_column(String(50),  nullable=False)
+    current_budget_pkr:  Mapped[float]         = mapped_column(Float,       nullable=False, default=0.0)
+    new_budget_pkr:      Mapped[Optional[float]]= mapped_column(Float,      nullable=True)
+    change_pct:          Mapped[float]         = mapped_column(Float,       nullable=False, default=0.0)
+    auto_executed:       Mapped[bool]          = mapped_column(Boolean,     nullable=False, default=False)
+    reason:              Mapped[Optional[str]] = mapped_column(Text,        nullable=True)
+
+    # What triggered the decision
+    # "out_of_stock" | "clearance" | "trending" | "organic_viral" | "low_roas" | "healthy" | "no_sku_match"
+    trigger: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# content_posts  — NEW session 6
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ContentPostRecord(Base):
+    """
+    One row per generated content piece per run.
+    Persists content_queue from the Content Agent so the dashboard can
+    show a "Content Calendar" view with Instagram + TikTok copy ready to use.
+    status starts as "pending" — updated to "posted" or "skipped" via the dashboard.
+    """
+    __tablename__ = "content_posts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
+    brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    sku:           Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    product_title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    variant_title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    is_urgent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # "pending" | "posted" | "skipped"
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+
+    # Instagram content
+    instagram_caption:   Mapped[Optional[str]]  = mapped_column(Text,        nullable=True)
+    instagram_hashtags:  Mapped[Optional[Any]]  = mapped_column(JSON,        nullable=True)  # list[str]
+    instagram_post_time: Mapped[Optional[str]]  = mapped_column(String(50),  nullable=True)
+
+    # TikTok content (stored as JSON to keep the 4-part structure)
+    tiktok_script:    Mapped[Optional[Any]] = mapped_column(JSON,       nullable=True)  # {hook, context, reveal, cta}
+    tiktok_post_time: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Metadata
+    creator_notes: Mapped[Optional[str]] = mapped_column(Text,        nullable=True)
+    sale_mention:  Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# return_insights  — NEW session 6
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ReturnInsightRecord(Base):
+    """
+    One row per flagged SKU per run from the Returns Agent.
+    Persists structured return patterns — enabling a "Returns Fix Queue"
+    dashboard table sorted by severity with fix_type filters.
+
+    Previously only alerts were written (text blobs). This table adds the
+    structured form so the dashboard can show: SKU, rate, reason, fix action.
+    healthy SKUs (< 3 returns, < 5% rate) are not persisted — noise reduction.
+    """
+    __tablename__ = "return_insights"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
+    brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    sku:           Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    product_title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+
+    total_returns:        Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_units_returned: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # see fashion_returns skill taxonomy
+    primary_reason: Mapped[str]           = mapped_column(String(100), nullable=False)
+    return_rate_pct: Mapped[Optional[float]] = mapped_column(Float,    nullable=True)
+    estimated_30d_sales: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # "critical" | "warning" | "info"
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+
+    recommended_fix: Mapped[str]           = mapped_column(Text,       nullable=False, default="")
+    # "update_size_guide" | "update_photos" | "update_description" |
+    # "quality_review" | "contact_supplier" | "monitor" | "no_action"
+    fix_type:        Mapped[str]           = mapped_column(String(100), nullable=False, default="monitor")
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

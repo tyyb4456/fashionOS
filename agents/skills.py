@@ -196,6 +196,68 @@ If sales data is unavailable, use ABSOLUTE RETURN COUNTS as a proxy:
 5. Supplier quality review → required for quality_issue patterns
 """,
 
+    "fashion_marketing": """
+## Fashion Marketing Intelligence Skill
+
+You are now loaded with specialized knowledge for managing Meta (Facebook/Instagram)
+ad campaigns for a Pakistani fashion brand.
+
+### Decision framework — apply in this EXACT order
+
+1. **No SKU match** (campaign name doesn't follow FashionOS_{SKU}_{desc} convention)
+   → hold. Cannot reason about a campaign without knowing which product it's for.
+
+2. **No campaign budget control** (has_daily_budget = false)
+   → hold. Ad-set level budgets can't be adjusted at campaign level via API.
+
+3. **Out of stock** (sku_current_stock < 5)
+   → pause immediately (auto-execute). Pointless to drive traffic to an unavailable
+     product. Pausing preserves audience learning for when stock returns.
+
+4. **On clearance** (sku_pricing_action = "clearance_code")
+   → pause immediately (auto-execute). Clearance items sell on discount alone;
+     paid ads waste money on customers who would have bought anyway from the code.
+
+5. **Trending SKU** (sku_is_trending = true, trend_score ≥ 0.5)
+   - ROAS ≥ 2.5 or no ROAS data: increase budget +25% (pending_approval)
+   - ROAS < 2.5 but spend > 0: hold — trend is real but ads are underperforming;
+     don't throw money at an inefficient campaign.
+
+6. **Organic viral** (sku_is_organic_viral = true, units_per_day ≥ 2× store average)
+   → decrease budget -30% (auto-execute). Product is selling without ad help;
+     reduce spend to avoid cannibalising organic demand.
+
+7. **Low ROAS** (spend_7d_pkr > PKR 500)
+   - roas_7d < 0.8: pause (auto-execute) — genuinely losing money
+   - 0.8 ≤ roas_7d < 1.5: decrease budget -20% (auto-execute) — underperforming
+
+8. **Healthy** (everything else, no signal)
+   → hold — no change.
+
+### Budget calculation rules
+- All new_daily_budget_pkr values must be rounded to the nearest PKR 50.
+  e.g. PKR 487 → 500, PKR 512 → 500, PKR 725 → 700.
+- Maximum increase per cycle: +30% (prevents Meta learning phase reset).
+- Maximum decrease per cycle: -50%.
+- Minimum daily budget: PKR 200. If decrease would go below PKR 200, pause instead.
+- auto_execute = True: hold, pause, decrease_budget with |change_pct| ≤ 30.
+- auto_execute = False: increase_budget, activate — always requires human approval.
+
+### Pakistani Meta Ads benchmarks (2025 context)
+- Average CPM: PKR 50-90 (Facebook), PKR 80-140 (Instagram Reels)
+- Strong fashion CTR: > 1.8%
+- Target ROAS for profitability: ≥ 2.5x (for typical 2× markup fashion brands)
+- Budget sweet spots: PKR 300-500/day (testing), PKR 1000-2000/day (scaling)
+- Peak ad performance: 7-10 PM PKT (same as organic content peak)
+- Best performing ad formats: Reels (Instagram), Video (Facebook)
+
+### Learning phase note
+Meta's algorithm needs 50 conversions per week per ad set to exit the learning phase.
+Brands under PKR 5000/day total ad spend may never fully exit learning phase.
+Avoid frequent budget changes — each >20% change resets the learning phase timer.
+This is why we cap increases at +30%: above that, Meta treats it as a new campaign.
+""",
+
 }
 
 
@@ -210,6 +272,7 @@ def load_skill(skill_name: str) -> str:
     - fashion_pricing    : Markdown strategy, margin rules, Pakistani price sensitivity
     - fashion_content    : Caption/TikTok script formulas, brand voice, posting times
     - fashion_returns    : Return reason taxonomy, rate thresholds, PK-specific patterns
+    - fashion_marketing  : Meta ad budget rules, ROAS thresholds, PK ad benchmarks
     """
     skill = SKILLS.get(skill_name)
     if skill is None:

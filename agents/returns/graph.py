@@ -23,36 +23,16 @@ Graph topology  (4 nodes, sequential):
       │                             Calculates return rate per SKU.
       │                             Produces one _ReturnPattern per affected SKU.
       ▼
-  write_state_outputs    ← Node 4: Converts patterns → AgentAlerts.
-      │                             critical/warning alerts for high-return SKUs.
-      │                             info alerts for low-return SKUs worth monitoring.
+  write_state_outputs    ← Node 4: Converts patterns → AgentAlerts (existing).
+      │                             NEW (session 6): also writes to state.return_insights
+      │                             (ReturnInsightData TypedDict) for DB persistence.
       ▼
     END
 
-Triggers:
-  - refunds/create webhook  → real-time analysis when a refund happens
-  - scheduled_run daily     → rolling 30-day review every day
-  - manual                  → on-demand analysis
-
-What it produces:
-  state.alerts — one alert per SKU with returns:
-    critical: return_rate > 15% or > 10 units returned
-    warning:  return_rate 10-15% or 6-10 units returned
-    info:     return_rate 5-10% or 3-5 units returned (monitor)
-    (healthy SKUs produce no alert — noise reduction)
-
-  Alert message includes:
-    - SKU, product name
-    - Total returns + return rate %
-    - Primary reason category
-    - Specific recommended fix (e.g. "Add cm measurements to size guide")
-    - Evidence (paraphrased customer reason text)
-
-No new MCP servers required — get_returns already in shopify-mcp.
-No new DB tables required — alerts flow into existing alerts table via save_run().
-
-Standalone test:
-  python -m agents.returns.graph
+Session 6 change:
+  write_state_outputs now writes TWO outputs:
+    state.alerts          → text alerts (existing — surfaced in dashboard notifications)
+    state.return_insights → structured data (new — persisted in return_insights DB table)
 """
 
 import json
@@ -69,7 +49,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from agents.skills import load_skill
-from agents.state import AgentAlert, InventorySnapshot
+from agents.state import AgentAlert, InventorySnapshot, ReturnInsightData
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -77,7 +57,7 @@ load_dotenv()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-SHOPIFY_MCP_URL      = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
+SHOPIFY_MCP_URL       = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
 RETURNS_LOOKBACK_DAYS = int(os.getenv("RETURNS_LOOKBACK_DAYS", "30"))
 
 model = init_chat_model("google_genai:gemini-2.5-flash-lite")
@@ -91,8 +71,8 @@ class _ReturnPattern(BaseModel):
     sku:           str
     product_title: str
 
-    total_returns:        int   = Field(ge=0, description="Number of return events in the lookback window.")
-    total_units_returned: int   = Field(ge=0, description="Total units returned (may differ from events if multi-quantity).")
+    total_returns:        int   = Field(ge=0)
+    total_units_returned: int   = Field(ge=0)
 
     primary_reason: str = Field(
         description=(
@@ -161,7 +141,7 @@ class _ReturnPattern(BaseModel):
 
 
 class _ReturnsAnalysis(BaseModel):
-    patterns:              list[_ReturnPattern]
+    patterns:               list[_ReturnPattern]
     total_returns_analyzed: int
     skus_analyzed:          int
     summary: str = Field(
@@ -182,19 +162,19 @@ class ReturnsAgentState(TypedDict):
     brand_name: str
 
     # From Inventory Agent (if it ran earlier in the same pipeline)
-    # Used for return rate calculation. Empty list is handled gracefully.
     inventory_snapshot: list[InventorySnapshot]
 
     # Node 1 output (internal scratch)
-    raw_returns:      list[dict]
-    returns_by_sku:   list[dict]   # grouped + enriched with sales data
+    raw_returns:    list[dict]
+    returns_by_sku: list[dict]
 
     # Internal scratch
     skill_content: str
     raw_analysis:  str
 
     # Final outputs → operator.add merges safely with other agents
-    alerts: Annotated[list[AgentAlert], operator.add]
+    alerts:          Annotated[list[AgentAlert],       operator.add]
+    return_insights: Annotated[list[ReturnInsightData], operator.add]  # NEW session 6
 
 
 # ── Helper ─────────────────────────────────────────────────────────────────────
@@ -224,13 +204,9 @@ def _parse_mcp_result(raw) -> list | dict:
 async def fetch_return_data(state: ReturnsAgentState) -> dict:
     """
     Fetches return records from shopify-mcp and groups them by SKU.
-
-    Uses get_returns(days=RETURNS_LOOKBACK_DAYS) — default 30 days.
-    Groups by SKU and calculates per-SKU stats.
-    Enriches with sales velocity from inventory_snapshot if available
-    (avoids a second MCP call — Inventory Agent already fetched this data).
+    Enriches with sales velocity from inventory_snapshot (no extra MCP call).
     """
-    client = MultiServerMCPClient(
+    client   = MultiServerMCPClient(
         {"shopify": {"url": SHOPIFY_MCP_URL, "transport": "streamable_http"}}
     )
     tools    = await client.get_tools()
@@ -240,9 +216,7 @@ async def fetch_return_data(state: ReturnsAgentState) -> dict:
 
     if "get_returns" in tool_map:
         try:
-            raw = await tool_map["get_returns"].ainvoke(
-                {"days": RETURNS_LOOKBACK_DAYS}
-            )
+            raw = await tool_map["get_returns"].ainvoke({"days": RETURNS_LOOKBACK_DAYS})
             raw_returns = _parse_mcp_result(raw)
             if not isinstance(raw_returns, list):
                 raw_returns = []
@@ -268,17 +242,15 @@ async def fetch_return_data(state: ReturnsAgentState) -> dict:
                 "total_units_returned": 0,
                 "reasons":              [],
                 "refunded_dates":       [],
-                "units_per_day":        0.0,          # filled below
+                "units_per_day":        0.0,
                 "estimated_30d_sales":  None,
             }
         entry = by_sku[sku]
         entry["total_returns"]        += 1
         entry["total_units_returned"] += r.get("quantity", 1)
-
         reason = (r.get("return_reason") or "").strip()
         if reason:
             entry["reasons"].append(reason)
-
         date = r.get("refunded_at", "")
         if date:
             entry["refunded_dates"].append(date[:10])
@@ -296,14 +268,11 @@ async def fetch_return_data(state: ReturnsAgentState) -> dict:
 
     print(
         f"[Returns] Grouped into {len(returns_by_sku)} SKUs. "
-        f"Top return count: "
+        f"Max returns on one SKU: "
         f"{max((d['total_returns'] for d in returns_by_sku), default=0)}"
     )
 
-    return {
-        "raw_returns":    raw_returns,
-        "returns_by_sku": returns_by_sku,
-    }
+    return {"raw_returns": raw_returns, "returns_by_sku": returns_by_sku}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -311,7 +280,6 @@ async def fetch_return_data(state: ReturnsAgentState) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_domain_skill(state: ReturnsAgentState) -> dict:
-    """Loads fashion_returns skill — reason taxonomy, rate thresholds, PK patterns."""
     skill = load_skill("fashion_returns")
     print("[Returns] Domain skill loaded.")
     return {"skill_content": skill}
@@ -323,13 +291,8 @@ def load_domain_skill(state: ReturnsAgentState) -> dict:
 
 async def run_gemini_analysis(state: ReturnsAgentState) -> dict:
     """
-    Single structured LLM call that:
-    1. Clusters raw free-text return reasons into 6 categories
-    2. Calculates return rate per SKU (using sales data if available)
-    3. Assigns severity (critical/warning/info/healthy)
-    4. Generates a specific, actionable recommended fix per SKU
-
-    Only processes SKUs where severity != healthy — healthy returns produce no alert.
+    Single structured LLM call: clusters reasons, calculates rates, assigns severity, generates fixes.
+    Only processes SKUs where severity != healthy.
     """
     returns_by_sku = state.get("returns_by_sku", [])
 
@@ -361,18 +324,16 @@ Analyse return records per SKU. For each SKU:
 
 ## Output rules
 - Include ONLY SKUs where severity is critical, warning, or info.
-- Skip "healthy" severity SKUs — don't waste the operator's attention on them.
-- If a SKU has reasons=[] (no reason text provided by customer), classify as
-  primary_reason="other" and recommend enabling required reason field on returns.
-- recommended_fix must name the actual product and be specific — not generic advice.
+- Skip "healthy" severity SKUs entirely.
+- If reasons=[] (no text), classify as primary_reason="other".
+- recommended_fix must name the actual product and be specific.
 - evidence must paraphrase, never directly quote customer text verbatim.
 """
 
     user_msg = (
-        f"Return data for {state['brand_name']} "
-        f"(last {RETURNS_LOOKBACK_DAYS} days):\n\n"
+        f"Return data for {state['brand_name']} (last {RETURNS_LOOKBACK_DAYS} days):\n\n"
         f"```json\n{json.dumps(returns_by_sku, indent=2)}\n```\n\n"
-        "Analyse each SKU and return the structured patterns."
+        "Analyse each SKU and return structured patterns."
     )
 
     structured_llm = model.with_structured_output(_ReturnsAnalysis)
@@ -401,32 +362,36 @@ Analyse return records per SKU. For each SKU:
 
 def write_state_outputs(state: ReturnsAgentState) -> dict:
     """
-    Converts _ReturnPattern objects → AgentAlerts.
+    Converts _ReturnPattern objects into TWO state outputs:
 
-    Alert level maps directly to severity:
-      critical → "critical"
-      warning  → "warning"
-      info     → "info"
-      healthy  → skipped (no alert generated)
+    1. state.alerts (existing)
+       Text alerts that surface in the dashboard notification feed.
+       Level maps directly from severity.
 
-    Message format includes: SKU, return count + rate, primary reason,
-    recommended fix, and evidence summary.
+    2. state.return_insights (NEW — session 6)
+       Structured ReturnInsightData dicts persisted in the return_insights DB table.
+       Enables the dashboard to show a proper "Returns Fix Queue" table
+       (fix_type filter, sort by severity) rather than parsing alert text.
+
+    healthy SKUs produce NEITHER an alert nor a return_insight — noise reduction.
     """
     analysis = _ReturnsAnalysis.model_validate_json(state["raw_analysis"])
     now_iso  = datetime.now(timezone.utc).isoformat()
-    alerts:  list[AgentAlert] = []
+
+    alerts:          list[AgentAlert]       = []
+    return_insights: list[ReturnInsightData] = []
 
     for p in analysis.patterns:
         if p.severity == "healthy":
-            continue   # never alert on healthy SKUs
+            continue
 
-        # Build rate string if available
+        # ── Build rate string ──────────────────────────────────────────────────
         rate_str = (
             f" ({p.return_rate_pct:.1f}% return rate)"
-            if p.return_rate_pct is not None
-            else ""
+            if p.return_rate_pct is not None else ""
         )
 
+        # ── Alert (text — dashboard notifications) ─────────────────────────────
         alerts.append(AgentAlert(
             level      = p.severity,
             agent      = "returns_agent",
@@ -442,6 +407,20 @@ def write_state_outputs(state: ReturnsAgentState) -> dict:
             created_at = now_iso,
         ))
 
+        # ── ReturnInsight (structured — DB persistence) ─────────────────────────
+        return_insights.append(ReturnInsightData(
+            sku                  = p.sku,
+            product_title        = p.product_title,
+            total_returns        = p.total_returns,
+            total_units_returned = p.total_units_returned,
+            primary_reason       = p.primary_reason,
+            return_rate_pct      = p.return_rate_pct,
+            estimated_30d_sales  = p.estimated_30d_sales,
+            severity             = p.severity,
+            recommended_fix      = p.recommended_fix,
+            fix_type             = p.fix_type,
+        ))
+
         print(
             f"[Returns] {p.severity.upper()} [{p.sku}]: "
             f"{p.total_units_returned} returns | "
@@ -452,9 +431,15 @@ def write_state_outputs(state: ReturnsAgentState) -> dict:
     if not alerts:
         print("[Returns] No actionable return issues found — all SKUs healthy.")
 
-    print(f"[Returns] Written {len(alerts)} alerts to state.")
+    print(
+        f"[Returns] Written {len(alerts)} alerts + "
+        f"{len(return_insights)} return insights to state."
+    )
 
-    return {"alerts": alerts}
+    return {
+        "alerts":          alerts,
+        "return_insights": return_insights,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -464,16 +449,16 @@ def write_state_outputs(state: ReturnsAgentState) -> dict:
 def build_returns_graph() -> StateGraph:
     graph = StateGraph(ReturnsAgentState)
 
-    graph.add_node("fetch_return_data",    fetch_return_data)
-    graph.add_node("load_domain_skill",    load_domain_skill)
-    graph.add_node("run_gemini_analysis",  run_gemini_analysis)
-    graph.add_node("write_state_outputs",  write_state_outputs)
+    graph.add_node("fetch_return_data",   fetch_return_data)
+    graph.add_node("load_domain_skill",   load_domain_skill)
+    graph.add_node("run_gemini_analysis", run_gemini_analysis)
+    graph.add_node("write_state_outputs", write_state_outputs)
 
-    graph.add_edge(START,                   "fetch_return_data")
-    graph.add_edge("fetch_return_data",     "load_domain_skill")
-    graph.add_edge("load_domain_skill",     "run_gemini_analysis")
-    graph.add_edge("run_gemini_analysis",   "write_state_outputs")
-    graph.add_edge("write_state_outputs",   END)
+    graph.add_edge(START,                  "fetch_return_data")
+    graph.add_edge("fetch_return_data",    "load_domain_skill")
+    graph.add_edge("load_domain_skill",    "run_gemini_analysis")
+    graph.add_edge("run_gemini_analysis",  "write_state_outputs")
+    graph.add_edge("write_state_outputs",  END)
 
     return graph.compile()
 
@@ -484,7 +469,6 @@ returns_graph = build_returns_graph()
 # ══════════════════════════════════════════════════════════════════════════════
 # Standalone test runner
 # python -m agents.returns.graph
-# (requires shopify-mcp on :8001 with a store that has some return history)
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -500,23 +484,28 @@ if __name__ == "__main__":
         initial_state: ReturnsAgentState = {
             "brand_id":          os.getenv("BRAND_ID",   "test-brand-001"),
             "brand_name":        os.getenv("BRAND_NAME", "TestBrand"),
-            "inventory_snapshot":[],    # empty — standalone, no Inventory Agent ran first
+            "inventory_snapshot":[],
             "raw_returns":       [],
             "returns_by_sku":    [],
             "skill_content":     "",
             "raw_analysis":      "",
             "alerts":            [],
+            "return_insights":   [],
         }
 
         result = await returns_graph.ainvoke(initial_state)
 
         print("\n── RETURN ALERTS ──────────────────────────────────────────────")
-        if result["alerts"]:
-            for alert in result["alerts"]:
-                print(f"\n  {alert['level'].upper()} [{alert.get('sku', '—')}]")
-                print(f"  {alert['message']}")
-        else:
-            print("  No actionable return issues — store return rates are healthy.")
+        for alert in result["alerts"]:
+            print(f"\n  {alert['level'].upper()} [{alert.get('sku', '—')}]")
+            print(f"  {alert['message'][:200]}")
+
+        print("\n── RETURN INSIGHTS (structured) ───────────────────────────────")
+        for insight in result["return_insights"]:
+            print(
+                f"  {insight['severity'].upper()} [{insight['sku']}] "
+                f"{insight['primary_reason']} | fix: {insight['fix_type']}"
+            )
 
         print("\n── DONE ───────────────────────────────────────────────────────\n")
 

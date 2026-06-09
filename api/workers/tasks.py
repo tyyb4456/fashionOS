@@ -9,16 +9,14 @@ Worker startup (Windows dev):
 Beat scheduler:
   celery -A api.workers.tasks beat --loglevel=info
 
-DB + asyncpg + Windows design note:
-  The module-level engine in db/session.py uses a connection pool whose
-  asyncpg sockets are bound to the ProactorEventLoop._proactor at creation
-  time. When _run_async() closes a loop, _proactor becomes None — the next
-  task's DB call through the pooled engine hits 'NoneType has no attribute send'.
+Session 6 change:
+  Summary dict now includes "marketing" stats block so the new
+  marketing_decisions_total / marketing_auto_executed / marketing_pending_approval
+  cached columns on agent_runs are populated correctly.
 
-  Fix: Celery workers bypass the module-level engine entirely. _save_run_to_db()
-  creates a fresh NullPool engine inside the running event loop, uses it, and
-  disposes it. NullPool = no connection reuse = no stale loop references.
-  FastAPI routes continue to use the normal pooled engine via get_session().
+DB + asyncpg + Windows design note:
+  _save_run_to_db() creates a fresh NullPool engine inside the running event loop.
+  Never re-raise DB exceptions — a DB hiccup must not retry the entire agent pipeline.
 """
 
 import asyncio
@@ -91,17 +89,9 @@ def _run_async(coro):
 
 async def _save_run_to_db(summary: dict, result: dict, task_id: str) -> None:
     """
-    Persists a completed run to PostgreSQL using a fresh NullPool engine.
-
-    Why not use the module-level engine from db/session.py?
-    That engine's asyncpg connections are bound to the ProactorEventLoop._proactor
-    that was active when the pool was created. On Windows, _proactor becomes None
-    when any event loop closes — so pooled connections from a previous loop's
-    lifetime hit 'NoneType has no attribute send' in the next task.
-
-    NullPool creates a fresh connection per session and closes it immediately
-    after — no binding to any particular loop. Slight overhead per write
-    is irrelevant at one DB write per 15-90 second agent run.
+    Persists a completed run using a fresh NullPool engine.
+    NullPool avoids the Windows ProactorEventLoop stale-connection issue.
+    Never raises — a DB failure must not retry the agent pipeline.
     """
     engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
     Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -116,7 +106,6 @@ async def _save_run_to_db(summary: dict, result: dict, task_id: str) -> None:
             f"[{task_id}] DB: Persist failed (non-fatal) — {db_exc}",
             exc_info=True,
         )
-        # Never re-raise — a DB hiccup must not retry the entire agent pipeline.
     finally:
         await engine.dispose()
 
@@ -166,6 +155,7 @@ def run_agent_pipeline(
             alerts        = result.get("alerts", [])
             critical      = [a for a in alerts if a.get("level") == "critical"]
             warnings      = [a for a in alerts if a.get("level") == "warning"]
+
             pricing       = result.get("pricing_recommendations", [])
             auto_priced   = [
                 p for p in pricing
@@ -175,6 +165,14 @@ def run_agent_pipeline(
                 p for p in pricing
                 if p.get("action") in ("markdown", "clearance_code", "increase", "bundle")
                 and p.get("discount_pct", 0) > 15
+            ]
+
+            # Marketing stats (NEW session 6)
+            marketing     = result.get("marketing_actions", [])
+            auto_marketing  = [m for m in marketing if m.get("auto_executed")]
+            pending_marketing = [
+                m for m in marketing
+                if not m.get("auto_executed") and m.get("action") not in ("hold",)
             ]
 
             summary = {
@@ -197,6 +195,12 @@ def run_agent_pipeline(
                     "auto_executed":    len(auto_priced),
                     "pending_approval": len(pending_price),
                 },
+                # Marketing (NEW session 6)
+                "marketing": {
+                    "total_decisions":  len(marketing),
+                    "auto_executed":    len(auto_marketing),
+                    "pending_approval": len(pending_marketing),
+                },
                 "task_id": task_id,
             }
 
@@ -210,7 +214,8 @@ def run_agent_pipeline(
         logger.info(
             f"[{task_id}] ✓ Pipeline complete | "
             f"agents={summary['completed_agents']} | "
-            f"alerts={summary['alert_counts']}"
+            f"alerts={summary['alert_counts']} | "
+            f"marketing={summary['marketing']}"
         )
 
         return summary
