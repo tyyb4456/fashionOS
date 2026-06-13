@@ -15,18 +15,25 @@ ngrok
 sqlalchemy[asyncio] 
 asyncpg                  
 psycopg2-binary          
-alembic                   
+alembic
+
+fastmcp
+httpx
+python-dotenv
+
+pytrends
+pandas
 
 
 # huggingface and related libraries
 
-langchain-huggingface 
-text-generation 
-transformers 
-google-search-results 
-numexpr 
-langchainhub 
-sentencepiece 
-jinja2 
-bitsandbytes 
-accelerate
+# langchain-huggingface 
+# text-generation 
+# transformers 
+# google-search-results 
+# numexpr 
+# langchainhub 
+# sentencepiece 
+# jinja2 
+# bitsandbytes 
+# accelerate

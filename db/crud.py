@@ -30,6 +30,8 @@ from db.models import (
     ReturnInsightRecord,
 )
 
+from sqlalchemy import update as sa_update 
+
 logger = logging.getLogger(__name__)
 
 
@@ -480,3 +482,133 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
         return dt
     except (ValueError, TypeError):
         return None
+    
+# ----------------
+# session 7 updation 
+# ---------------
+    
+
+async def get_pricing_action(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[PricingActionRecord]:
+    result = await session.execute(
+        select(PricingActionRecord).where(PricingActionRecord.id == record_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_marketing_action(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[MarketingActionRecord]:
+    result = await session.execute(
+        select(MarketingActionRecord).where(MarketingActionRecord.id == record_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_restock_recommendation(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[RestockRecommendationRecord]:
+    result = await session.execute(
+        select(RestockRecommendationRecord).where(RestockRecommendationRecord.id == record_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_content_post(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[ContentPostRecord]:
+    result = await session.execute(
+        select(ContentPostRecord).where(ContentPostRecord.id == record_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def mark_pricing_executed(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[PricingActionRecord]:
+    """Set auto_executed=True on a pricing action record."""
+    await session.execute(
+        sa_update(PricingActionRecord)
+        .where(PricingActionRecord.id == record_id)
+        .values(auto_executed=True)
+    )
+    await session.flush()
+    return await get_pricing_action(session, record_id)
+
+
+async def mark_pricing_rejected(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[PricingActionRecord]:
+    """Set action='rejected' so the dashboard can filter it out."""
+    await session.execute(
+        sa_update(PricingActionRecord)
+        .where(PricingActionRecord.id == record_id)
+        .values(action="rejected")
+    )
+    await session.flush()
+    return await get_pricing_action(session, record_id)
+
+
+async def mark_marketing_executed(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[MarketingActionRecord]:
+    """Set auto_executed=True on a marketing action record."""
+    await session.execute(
+        sa_update(MarketingActionRecord)
+        .where(MarketingActionRecord.id == record_id)
+        .values(auto_executed=True)
+    )
+    await session.flush()
+    return await get_marketing_action(session, record_id)
+
+
+async def mark_marketing_rejected(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[MarketingActionRecord]:
+    """Set action='rejected' on a marketing action record."""
+    await session.execute(
+        sa_update(MarketingActionRecord)
+        .where(MarketingActionRecord.id == record_id)
+        .values(action="rejected")
+    )
+    await session.flush()
+    return await get_marketing_action(session, record_id)
+
+
+async def update_restock_status(
+    session: AsyncSession,
+    record_id: str,
+    new_status: str,   # "approved" | "ordered" | "cancelled"
+) -> Optional[RestockRecommendationRecord]:
+    """Update restock recommendation status."""
+    await session.execute(
+        sa_update(RestockRecommendationRecord)
+        .where(RestockRecommendationRecord.id == record_id)
+        .values(status=new_status)
+    )
+    await session.flush()
+    return await get_restock_recommendation(session, record_id)
+
+
+async def update_content_post_status(
+    session: AsyncSession,
+    record_id: str,
+    new_status: str,   # "posted" | "skipped"
+) -> Optional[ContentPostRecord]:
+    """Update content post status."""
+    await session.execute(
+        sa_update(ContentPostRecord)
+        .where(ContentPostRecord.id == record_id)
+        .values(status=new_status)
+    )
+    await session.flush()
+    return await get_content_post(session, record_id)

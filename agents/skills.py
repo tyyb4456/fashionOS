@@ -1,10 +1,17 @@
 """
 FashionOS Skills — Domain knowledge packages for each agent.
 
-Each skill is a specialized prompt + context block that an agent loads
-on-demand via load_skill(). This follows the LangChain Skills pattern:
-progressive disclosure of domain knowledge without bloating the base
-system prompt.
+Each skill is injected into an agent's Node 3 system prompt via load_skill().
+This keeps base system prompts lean and domain knowledge versioned here.
+
+Skills:
+  fashion_inventory  → Inventory Agent, Restock Agent
+  fashion_trend      → Trend Agent
+  fashion_pricing    → Pricing Agent
+  fashion_content    → Content Agent
+  fashion_returns    → Returns Agent
+  fashion_marketing  → Marketing Agent
+  fashion_dm         → DM Agent  ← NEW session 7
 """
 
 SKILLS: dict[str, str] = {
@@ -135,65 +142,33 @@ Cluster raw customer return reason text into ONE of these categories:
 
 - **size_issue**: "too big", "too small", "sizing off", "runs large/small", "didn't fit",
   "size chart wrong"
-  → Fix: Add precise cm/inch measurements to size guide. Add fit notes (e.g. "slim fit —
-    size up if between sizes"). Photograph the garment flat with a ruler for scale.
+  → Fix: Add precise cm/inch measurements to size guide.
 
 - **description_mismatch**: "not as described", "color looks different in person",
   "fabric not what I expected", "different from photo", "color inaccurate on screen"
-  → Fix: Reshoot product in natural outdoor light. Add color accuracy disclaimer.
-    Add exact fabric composition + weight (grams per sqm) to description.
+  → Fix: Reshoot in natural outdoor light. Add fabric weight (gsm) to description.
 
 - **quality_issue**: "poor stitching", "bad quality fabric", "zipper broke on first wear",
-  "color faded after one wash", "threading loose", "fell apart"
-  → Fix: Flag supplier for quality review. Request a production batch hold.
-    Consider removing the product until quality is resolved.
+  "color faded after one wash", "threading loose"
+  → Fix: Flag supplier for quality review. Request production batch hold.
 
 - **changed_mind**: "ordered by mistake", "didn't like how it looked on me",
-  "found cheaper elsewhere", "gifted already have it", "no longer needed"
-  → Fix: Monitor — high changed_mind may mean misleading marketing or impulse purchases.
-    Consider adding more accurate lifestyle shots.
+  "found cheaper elsewhere"
+  → Fix: Monitor — high changed_mind may mean misleading marketing.
 
-- **late_delivery**: "arrived too late for Eid", "wedding passed already",
-  "needed for a specific event"
-  → Fix: Add occasion-specific delivery warnings (e.g. "Order 7 days before your event").
-    Show estimated delivery prominently on the product page.
+- **late_delivery**: "arrived too late for Eid", "needed for a specific event"
+  → Fix: Add occasion-specific delivery warnings on the product page.
 
 - **duplicate_order**: "ordered twice by accident", "double charged"
-  → Fix: No product fix needed. Review checkout UX or payment confirmation flow.
+  → Fix: No product fix needed. Review checkout UX.
 
 - **other**: anything that doesn't fit above categories clearly.
 
 ### Return rate thresholds (Pakistani fashion context)
-Calculate: return_rate_pct = (total_units_returned / estimated_30d_sales) × 100
-Where estimated_30d_sales = units_per_day × 30 (from Inventory Agent data if available).
-
-- < 5%:  **healthy** — no action, just monitor
-- 5-10%: **info** — log the reason, low priority fix
-- 10-15%: **warning** — fix needed within 2 weeks
-- > 15%: **critical** — immediate action, high revenue impact
-
-If sales data is unavailable, use ABSOLUTE RETURN COUNTS as a proxy:
-- < 3 units returned in 30 days: healthy
-- 3-5 units: info
-- 6-10 units: warning
-- > 10 units: critical
-
-### Pakistani fashion-specific return patterns
-- Size guide issues are the #1 cause of returns in Pakistani fashion (60%+ of returns)
-  — because most local brands don't provide cm measurements, only S/M/L labels
-- Lawn and chiffon fabric returns spike in summer — customers expect specific drape/weight
-  — fix: add fabric weight (grams per sqm) and drape description
-- Color accuracy is a persistent problem — phone screens render fabric colors inaccurately
-  — fix: outdoor natural light photos + color disclaimer in listing
-- Returns for "changed mind" spike 2 weeks after Eid sales — impulse buys coming back
-  — this is seasonal, not a product fix issue
-
-### Fix priority by ROI
-1. Size guide table with cm + inches → reduces size_issue returns ~40%
-2. Natural light / accurate color photos → reduces description_mismatch ~30%
-3. Fabric weight + feel description → reduces expectation mismatch ~20%
-4. Occasion delivery warnings → reduces late_delivery returns ~60%
-5. Supplier quality review → required for quality_issue patterns
+- < 5%:   healthy — no action
+- 5-10%:  info — log the reason, low priority fix
+- 10-15%: warning — fix needed within 2 weeks
+- > 15%:  critical — immediate action, high revenue impact
 """,
 
     "fashion_marketing": """
@@ -211,51 +186,132 @@ ad campaigns for a Pakistani fashion brand.
    → hold. Ad-set level budgets can't be adjusted at campaign level via API.
 
 3. **Out of stock** (sku_current_stock < 5)
-   → pause immediately (auto-execute). Pointless to drive traffic to an unavailable
-     product. Pausing preserves audience learning for when stock returns.
+   → pause immediately (auto-execute).
 
 4. **On clearance** (sku_pricing_action = "clearance_code")
-   → pause immediately (auto-execute). Clearance items sell on discount alone;
-     paid ads waste money on customers who would have bought anyway from the code.
+   → pause immediately (auto-execute).
 
 5. **Trending SKU** (sku_is_trending = true, trend_score ≥ 0.5)
    - ROAS ≥ 2.5 or no ROAS data: increase budget +25% (pending_approval)
-   - ROAS < 2.5 but spend > 0: hold — trend is real but ads are underperforming;
-     don't throw money at an inefficient campaign.
+   - ROAS < 2.5 but spend > 0: hold
 
-6. **Organic viral** (sku_is_organic_viral = true, units_per_day ≥ 2× store average)
-   → decrease budget -30% (auto-execute). Product is selling without ad help;
-     reduce spend to avoid cannibalising organic demand.
+6. **Organic viral** (sku_is_organic_viral = true)
+   → decrease budget -30% (auto-execute).
 
 7. **Low ROAS** (spend_7d_pkr > PKR 500)
-   - roas_7d < 0.8: pause (auto-execute) — genuinely losing money
-   - 0.8 ≤ roas_7d < 1.5: decrease budget -20% (auto-execute) — underperforming
+   - roas_7d < 0.8: pause (auto-execute)
+   - 0.8 ≤ roas_7d < 1.5: decrease budget -20% (auto-execute)
 
-8. **Healthy** (everything else, no signal)
-   → hold — no change.
+8. **Healthy** (everything else)
+   → hold.
 
-### Budget calculation rules
-- All new_daily_budget_pkr values must be rounded to the nearest PKR 50.
-  e.g. PKR 487 → 500, PKR 512 → 500, PKR 725 → 700.
-- Maximum increase per cycle: +30% (prevents Meta learning phase reset).
-- Maximum decrease per cycle: -50%.
-- Minimum daily budget: PKR 200. If decrease would go below PKR 200, pause instead.
-- auto_execute = True: hold, pause, decrease_budget with |change_pct| ≤ 30.
-- auto_execute = False: increase_budget, activate — always requires human approval.
+### Budget rules
+- Round new_daily_budget_pkr to nearest PKR 50.
+- Minimum: PKR 200. If decrease goes below, pause instead.
+- Max change per cycle: +30% / -50%.
+- auto_execute = True: hold, pause, decrease ≤30%.
+- auto_execute = False: increase_budget, activate (always human approval).
 
-### Pakistani Meta Ads benchmarks (2025 context)
-- Average CPM: PKR 50-90 (Facebook), PKR 80-140 (Instagram Reels)
-- Strong fashion CTR: > 1.8%
-- Target ROAS for profitability: ≥ 2.5x (for typical 2× markup fashion brands)
+### Pakistani Meta Ads benchmarks
+- Target ROAS for profitability: ≥ 2.5x
+- Strong CTR: > 1.8%
 - Budget sweet spots: PKR 300-500/day (testing), PKR 1000-2000/day (scaling)
-- Peak ad performance: 7-10 PM PKT (same as organic content peak)
-- Best performing ad formats: Reels (Instagram), Video (Facebook)
+- Peak performance: 7-10 PM PKT
+""",
 
-### Learning phase note
-Meta's algorithm needs 50 conversions per week per ad set to exit the learning phase.
-Brands under PKR 5000/day total ad spend may never fully exit learning phase.
-Avoid frequent budget changes — each >20% change resets the learning phase timer.
-This is why we cap increases at +30%: above that, Meta treats it as a new campaign.
+    "fashion_dm": """
+## Fashion DM Intelligence Skill
+
+You are now loaded with specialized knowledge for Instagram DM management
+for a Pakistani fashion brand.
+
+### Category classification
+
+**size_question** — Asking about measurements, fit, or available sizes.
+  Triggers: "size chart", "size guide", "what size", "measurements", "fit",
+            "small/medium/large", "inches", "cm", "do you have size",
+            "size hai", "kaunsa size", "kitna size"
+  → auto_send = True
+
+**availability** — Asking if a product is in stock, or when it will be back.
+  Triggers: "in stock", "available", "do you have", "stock hai", "available hai",
+            "when will it be back", "restock kab", "mil sakta hai"
+  → auto_send = True. Use inventory data to give accurate answer.
+
+**order_status** — Questions about an existing order (delivery, tracking, delays).
+  Triggers: "order", "delivery", "kab aayega", "tracking", "shipped", "delayed",
+            "where is my order", "not received yet", "kitne din"
+  → auto_send = True. Give support contact, NOT specific delivery promises.
+
+**general_inquiry** — Price questions, how to order, payment, return policy,
+  compliments, or anything not in the above categories.
+  → auto_send = True. Helpful, friendly response.
+
+**bulk_inquiry** — Wholesale, reseller, or 10+ unit inquiries.
+  Triggers: "wholesale", "bulk", "reseller", "50 pieces", "business inquiry",
+            "price list for bulk", "distributor", "retail price"
+  → auto_send = False. flag_for_human = True. flag_priority = "high".
+  This is a real revenue opportunity — human must negotiate.
+
+**complaint** — Unhappy customer, damaged/wrong item, refund request.
+  Triggers: "refund", "return", "damaged", "wrong item", "not happy",
+            "disappointed", "fraud", "scam", "complaint", "cheated"
+  → auto_send = False. flag_for_human = True. flag_priority = "high".
+  Never auto-reply to complaints — human touch is essential.
+
+**influencer** — Content creator, blogger, or collab request.
+  Triggers: "collab", "collaboration", "gifting", "PR package", "influencer",
+            "review", "brand ambassador", "content creator", "send me free"
+  → auto_send = False. flag_for_human = True. flag_priority = "normal".
+
+**spam** — Clearly promotional or irrelevant.
+  → auto_send = False. flag_for_human = False. No reply, no alert.
+
+### Brand voice for auto-replies
+- Warm and conversational, like a friendly brand account (not corporate)
+- Urdu-English code-switch is natural and encouraged:
+  "Ji bilkul!", "Haan available hai!", "Zaroor!", "Shukria for reaching out!"
+- Never start with "Dear Customer" or "Hello there"
+- Use @username when available: "Hi @sara_lahore!"
+- Keep it short — 2-4 sentences max
+- One clear call to action per reply
+- NEVER promise specific delivery times or discount codes
+
+### Reply templates
+
+**size_question:**
+"Hi @[username]! Our size chart is in the product description with measurements
+in both cm and inches. [Product] runs true to size — if you're between sizes,
+we recommend sizing up. DM us your measurements and we'll help you pick the
+perfect fit! 💫"
+
+**availability (in stock):**
+"Ji haan @[username], [product] is available in [sizes]! 🎉
+Order via link in bio or DM us on WhatsApp for easy checkout.
+Stock is limited so grab it fast! 💨"
+
+**availability (out of stock):**
+"Hi @[username]! Yeh size abhi stock mein nahi hai unfortunately 😔
+We're restocking soon — drop your size in DMs and we'll notify you first!
+Stay tuned to our stories for restock announcements 💌"
+
+**order_status:**
+"Hi @[username]! For order updates, please WhatsApp us at [brand number]
+or reply here with your order number and we'll check right away.
+Average delivery in Pakistan is 3-5 working days 📦"
+
+**general_inquiry:**
+"Hi @[username]! Thanks for reaching out 💫
+[Answer the specific question or give helpful info].
+Feel free to DM anytime — we're here 24/7!"
+
+### Availability answer rules
+1. Check the inventory data provided in the system prompt
+2. Match customer's mentioned product to the closest product_title in inventory
+3. If current_stock > 5 → "available"
+4. If current_stock 1-5 → "available but very limited"
+5. If current_stock = 0 → "out of stock, restocking soon"
+6. If no match found → don't guess, say "let me check and get back to you"
 """,
 
 }
@@ -273,6 +329,7 @@ def load_skill(skill_name: str) -> str:
     - fashion_content    : Caption/TikTok script formulas, brand voice, posting times
     - fashion_returns    : Return reason taxonomy, rate thresholds, PK-specific patterns
     - fashion_marketing  : Meta ad budget rules, ROAS thresholds, PK ad benchmarks
+    - fashion_dm         : DM category rules, reply templates, brand voice for DMs
     """
     skill = SKILLS.get(skill_name)
     if skill is None:

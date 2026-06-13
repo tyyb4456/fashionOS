@@ -17,7 +17,9 @@ RUN apt-get update \
 
 # Install Python deps first — this layer is cached unless requirements.txt changes
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install \
+    --default-timeout=300 \
+    -r requirements.txt
 
 # Copy server code
 COPY server.py .

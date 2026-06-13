@@ -1,0 +1,39 @@
+# Secrets — never in image
+.env
+.env.*
+mcp_servers/**/.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Version control
+.git/
+.gitignore
+.github/
+
+# Dev tools
+.vscode/
+.idea/
+*.ipynb
+test*.py
+gen_sig.py
+
+# Celery beat state (generated at runtime)
+celerybeat-schedule*
+
+# Docs (not needed in image)
+*.md
+!README.md
+
+# Docker files themselves
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Alembic versions already in repo — keep those
+# But skip local migration artifacts
+alembic.ini.local

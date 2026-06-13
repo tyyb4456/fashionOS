@@ -38,6 +38,20 @@ from fastmcp import FastMCP
 
 load_dotenv()
 
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+
+load_dotenv()
+
+# ── urllib3 v2 compat patch ───────────────────────────────────────────────────
+import urllib3.util.retry as _urllib3_retry
+_orig_retry_init = _urllib3_retry.Retry.__init__
+def _patched_retry_init(self, *args, method_whitelist=None, **kwargs):
+    if method_whitelist is not None:
+        kwargs.setdefault("allowed_methods", method_whitelist)
+    _orig_retry_init(self, *args, **kwargs)
+_urllib3_retry.Retry.__init__ = _patched_retry_init
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_GEO = os.getenv("TRENDS_DEFAULT_GEO", "PK")

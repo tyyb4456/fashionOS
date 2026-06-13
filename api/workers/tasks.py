@@ -1,22 +1,12 @@
 """
 FashionOS Celery Workers
 ========================
-Async task queue that decouples HTTP request handling from agent execution.
+Session 7: Added run_scheduled_dm task + dm-check beat entry (every 30 min).
 
-Worker startup (Windows dev):
-  celery -A api.workers.tasks worker --loglevel=info --pool=solo
-
-Beat scheduler:
-  celery -A api.workers.tasks beat --loglevel=info
-
-Session 6 change:
-  Summary dict now includes "marketing" stats block so the new
-  marketing_decisions_total / marketing_auto_executed / marketing_pending_approval
-  cached columns on agent_runs are populated correctly.
-
-DB + asyncpg + Windows design note:
-  _save_run_to_db() creates a fresh NullPool engine inside the running event loop.
-  Never re-raise DB exceptions — a DB hiccup must not retry the entire agent pipeline.
+Beat schedule:
+  hourly-inventory-sweep  → every hour, :00
+  daily-full-sweep        → daily at 00:05 PKT
+  dm-check                → every 30 min  ← NEW session 7
 """
 
 import asyncio
@@ -65,6 +55,11 @@ celery_app.conf.update(
             "task":     "api.workers.tasks.run_scheduled_daily",
             "schedule": crontab(hour=0, minute=5),
         },
+        # NEW session 7 — poll DMs every 30 minutes
+        "dm-check": {
+            "task":     "api.workers.tasks.run_scheduled_dm",
+            "schedule": crontab(minute="*/30"),
+        },
     },
 )
 
@@ -79,7 +74,6 @@ DATABASE_URL = os.getenv(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _run_async(coro):
-    """Run one coroutine in a fresh event loop. Call exactly once per task."""
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
@@ -88,12 +82,7 @@ def _run_async(coro):
 
 
 async def _save_run_to_db(summary: dict, result: dict, task_id: str) -> None:
-    """
-    Persists a completed run using a fresh NullPool engine.
-    NullPool avoids the Windows ProactorEventLoop stale-connection issue.
-    Never raises — a DB failure must not retry the agent pipeline.
-    """
-    engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
+    engine  = create_async_engine(DATABASE_URL, poolclass=NullPool)
     Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     try:
@@ -102,10 +91,7 @@ async def _save_run_to_db(summary: dict, result: dict, task_id: str) -> None:
                 await crud.save_run(session, summary, result)
         logger.info(f"[{task_id}] DB: Run persisted (run_id={summary['run_id']}).")
     except Exception as db_exc:
-        logger.error(
-            f"[{task_id}] DB: Persist failed (non-fatal) — {db_exc}",
-            exc_info=True,
-        )
+        logger.error(f"[{task_id}] DB: Persist failed (non-fatal) — {db_exc}", exc_info=True)
     finally:
         await engine.dispose()
 
@@ -148,32 +134,24 @@ def run_agent_pipeline(
         )
 
         async def _run_pipeline_and_save():
-            # ── Step 1: run the supervisor graph ──────────────────────────────
             result = await supervisor_graph.ainvoke(initial_state)
 
-            # ── Step 2: build summary ─────────────────────────────────────────
             alerts        = result.get("alerts", [])
             critical      = [a for a in alerts if a.get("level") == "critical"]
             warnings      = [a for a in alerts if a.get("level") == "warning"]
 
             pricing       = result.get("pricing_recommendations", [])
-            auto_priced   = [
-                p for p in pricing
-                if p.get("action") == "markdown" and p.get("discount_pct", 0) <= 15
-            ]
-            pending_price = [
-                p for p in pricing
-                if p.get("action") in ("markdown", "clearance_code", "increase", "bundle")
-                and p.get("discount_pct", 0) > 15
-            ]
+            auto_priced   = [p for p in pricing if p.get("action") == "markdown" and p.get("discount_pct", 0) <= 15]
+            pending_price = [p for p in pricing if p.get("action") in ("markdown", "clearance_code", "increase", "bundle") and p.get("discount_pct", 0) > 15]
 
-            # Marketing stats (NEW session 6)
-            marketing     = result.get("marketing_actions", [])
-            auto_marketing  = [m for m in marketing if m.get("auto_executed")]
-            pending_marketing = [
-                m for m in marketing
-                if not m.get("auto_executed") and m.get("action") not in ("hold",)
-            ]
+            marketing         = result.get("marketing_actions", [])
+            auto_marketing    = [m for m in marketing if m.get("auto_executed")]
+            pending_marketing = [m for m in marketing if not m.get("auto_executed") and m.get("action") not in ("hold",)]
+
+            # DM stats (NEW session 7)
+            dm_replies    = result.get("dm_replies", [])
+            dm_auto_sent  = [r for r in dm_replies if r.get("auto_sent")]
+            dm_flagged    = [r for r in dm_replies if r.get("flagged")]
 
             summary = {
                 "run_id":           result.get("run_id", initial_state["run_id"]),
@@ -195,18 +173,20 @@ def run_agent_pipeline(
                     "auto_executed":    len(auto_priced),
                     "pending_approval": len(pending_price),
                 },
-                # Marketing (NEW session 6)
                 "marketing": {
                     "total_decisions":  len(marketing),
                     "auto_executed":    len(auto_marketing),
                     "pending_approval": len(pending_marketing),
                 },
+                # DM stats — not persisted to DB yet (session 8)
+                "dm": {
+                    "auto_replied": len(dm_auto_sent),
+                    "flagged":      len(dm_flagged),
+                },
                 "task_id": task_id,
             }
 
-            # ── Step 3: persist with a fresh NullPool engine ──────────────────
             await _save_run_to_db(summary, result, task_id)
-
             return result, summary
 
         result, summary = _run_async(_run_pipeline_and_save())
@@ -215,9 +195,8 @@ def run_agent_pipeline(
             f"[{task_id}] ✓ Pipeline complete | "
             f"agents={summary['completed_agents']} | "
             f"alerts={summary['alert_counts']} | "
-            f"marketing={summary['marketing']}"
+            f"dm={summary['dm']}"
         )
-
         return summary
 
     except Exception as exc:
@@ -257,4 +236,27 @@ def run_scheduled_daily():
         brand_name      = brand_name,
         trigger         = "scheduled_run",
         trigger_payload = {"schedule_type": "daily"},
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TASK 4 — DM check (every 30 min)  — NEW session 7
+# ══════════════════════════════════════════════════════════════════════════════
+
+@celery_app.task(name="api.workers.tasks.run_scheduled_dm")
+def run_scheduled_dm():
+    """
+    Polls Instagram DMs every 30 minutes and auto-replies to common questions.
+    Flags bulk inquiries and complaints for human review.
+    Runs independently of the daily sweep — DM response time matters.
+    """
+    brand_id   = os.getenv("BRAND_ID",   "default-brand")
+    brand_name = os.getenv("BRAND_NAME", "FashionOS Brand")
+    logger.info(f"[beat] DM check sweep for brand={brand_name}")
+    run_agent_pipeline.delay(
+        brand_id        = brand_id,
+        brand_name      = brand_name,
+        trigger         = "scheduled_run",
+        trigger_payload = {"schedule_type": "dm"},
+        agents_to_run   = ["dm"],
     )
