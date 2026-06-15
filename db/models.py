@@ -309,3 +309,70 @@ class ReturnInsightRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# brands  — tenant registry
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Brand(Base):
+    __tablename__ = "brands"
+
+    id:         Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    brand_id:   Mapped[str]       = mapped_column(String(100), unique=True, nullable=False, index=True)
+    brand_name: Mapped[str]       = mapped_column(String(255), nullable=False)
+    owner_email:Mapped[str]       = mapped_column(String(255), unique=True, nullable=False, index=True)
+    plan:       Mapped[str]       = mapped_column(String(50),  nullable=False, default="starter")
+    is_active:  Mapped[bool]      = mapped_column(Boolean,     nullable=False, default=True)
+
+    # Shopify
+    shopify_shop_name:          Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    shopify_access_token_enc:   Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    shopify_webhook_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Meta Ads
+    meta_access_token_enc: Mapped[Optional[str]] = mapped_column(Text,        nullable=True)
+    meta_ad_account_id:    Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Instagram DMs
+    instagram_access_token_enc: Mapped[Optional[str]] = mapped_column(Text,        nullable=True)
+    instagram_page_id:          Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Notification recipients (WHERE to send — brand owner's contacts)
+    brand_owner_whatsapp: Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    brand_owner_email:    Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# api_keys  — one or more per brand
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ApiKey(Base):
+    """
+    API key for a brand. The plaintext key is shown once on creation;
+    only the SHA-256 hash is persisted here.
+
+    key_prefix: first portion (e.g. "fos_mybrand") stored for fast lookup.
+    key_hash:   sha256(full_key) — compared on every request.
+    """
+    __tablename__ = "api_keys"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    brand_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+    key_prefix:   Mapped[str]           = mapped_column(String(20),  nullable=False)
+    key_hash:     Mapped[str]           = mapped_column(String(64),  nullable=False, unique=True, index=True)
+    label:        Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_active:    Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

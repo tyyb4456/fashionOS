@@ -282,7 +282,7 @@ async def fetch_campaign_data(state: MarketingAgentState) -> dict:
     # ── Fetch campaigns ────────────────────────────────────────────────────────
     if "get_campaigns" in tool_map:
         try:
-            raw = await tool_map["get_campaigns"].ainvoke({"active_only": True})
+            raw = await tool_map["get_campaigns"].ainvoke({"active_only": True, "brand_id": state["brand_id"]})
             result = _parse_mcp_result(raw)
 
             # Handle error response from server (missing credentials, etc.)
@@ -316,7 +316,7 @@ async def fetch_campaign_data(state: MarketingAgentState) -> dict:
             if "get_campaign_performance" in tool_map:
                 try:
                     raw_perf = await tool_map["get_campaign_performance"].ainvoke(
-                        {"campaign_id": campaign_id, "days": 7}
+                        {"campaign_id": campaign_id, "days": 7, "brand_id": state["brand_id"]}
                     )
                     perf = _parse_mcp_result(raw_perf)
                     if "error" in perf:
@@ -575,6 +575,7 @@ async def execute_marketing_actions(state: MarketingAgentState) -> dict:
                     await tool_map["pause_campaign"].ainvoke({
                         "campaign_id": d.campaign_id,
                         "reason":      f"[AUTO] {d.reason}",
+                        "brand_id":    state["brand_id"]
                     })
                     print(f"[Marketing] ✓ Paused {d.campaign_id} ({d.campaign_name}): {d.trigger}")
 
@@ -609,6 +610,7 @@ async def execute_marketing_actions(state: MarketingAgentState) -> dict:
                         "campaign_id":          d.campaign_id,
                         "new_daily_budget_pkr": d.new_daily_budget_pkr,
                         "reason":               f"[AUTO] {d.reason}",
+                        "brand_id":             state["brand_id"],
                     })
                     print(
                         f"[Marketing] ✓ Budget decreased {d.campaign_id}: "

@@ -24,6 +24,8 @@ python-dotenv
 pytrends
 pandas
 
+cryptography 
+
 
 # huggingface and related libraries
 

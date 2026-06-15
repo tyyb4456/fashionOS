@@ -204,40 +204,57 @@ def run_agent_pipeline(
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
+async def _fetch_active_brands() -> list[tuple[str, str]]:
+    """Returns list of (brand_id, brand_name) for all active brands."""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+    from db.models import Brand
+
+    engine  = create_async_engine(DATABASE_URL, poolclass=NullPool)
+    Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with Session() as session:
+            result = await session.execute(
+                select(Brand.brand_id, Brand.brand_name).where(Brand.is_active == True)  # noqa: E712
+            )
+            return result.all()
+    finally:
+        await engine.dispose()
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TASK 2 — Hourly inventory sweep
+# TASK 2 — Hourly inventory sweep (all active brands)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @celery_app.task(name="api.workers.tasks.run_scheduled_inventory")
 def run_scheduled_inventory():
-    brand_id   = os.getenv("BRAND_ID",   "default-brand")
-    brand_name = os.getenv("BRAND_NAME", "FashionOS Brand")
-    logger.info(f"[beat] Hourly inventory sweep for brand={brand_name}")
-    run_agent_pipeline.delay(
-        brand_id        = brand_id,
-        brand_name      = brand_name,
-        trigger         = "scheduled_run",
-        trigger_payload = {"schedule_type": "hourly"},
-        agents_to_run   = ["inventory"],
-    )
-
+    brands = _run_async(_fetch_active_brands())
+    logger.info(f"[beat] Hourly sweep — {len(brands)} active brands.")
+    for brand_id, brand_name in brands:
+        run_agent_pipeline.delay(
+            brand_id=brand_id, brand_name=brand_name,
+            trigger="scheduled_run",
+            trigger_payload={"schedule_type": "hourly"},
+            agents_to_run=["inventory"],
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TASK 3 — Daily full sweep
+# TASK 3 — Daily full sweep (all active brands)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @celery_app.task(name="api.workers.tasks.run_scheduled_daily")
 def run_scheduled_daily():
-    brand_id   = os.getenv("BRAND_ID",   "default-brand")
-    brand_name = os.getenv("BRAND_NAME", "FashionOS Brand")
-    logger.info(f"[beat] Daily full sweep for brand={brand_name}")
-    run_agent_pipeline.delay(
-        brand_id        = brand_id,
-        brand_name      = brand_name,
-        trigger         = "scheduled_run",
-        trigger_payload = {"schedule_type": "daily"},
-    )
-
+    brands = _run_async(_fetch_active_brands())
+    logger.info(f"[beat] Daily sweep — {len(brands)} active brands.")
+    for i, (brand_id, brand_name) in enumerate(brands):
+        run_agent_pipeline.apply_async(
+            kwargs=dict(
+                brand_id=brand_id, brand_name=brand_name,
+                trigger="scheduled_run",
+                trigger_payload={"schedule_type": "daily"},
+            ),
+            countdown=i * 30,   # stagger 30s per brand — avoids thundering herd
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TASK 4 — DM check (every 30 min)  — NEW session 7
@@ -245,18 +262,11 @@ def run_scheduled_daily():
 
 @celery_app.task(name="api.workers.tasks.run_scheduled_dm")
 def run_scheduled_dm():
-    """
-    Polls Instagram DMs every 30 minutes and auto-replies to common questions.
-    Flags bulk inquiries and complaints for human review.
-    Runs independently of the daily sweep — DM response time matters.
-    """
-    brand_id   = os.getenv("BRAND_ID",   "default-brand")
-    brand_name = os.getenv("BRAND_NAME", "FashionOS Brand")
-    logger.info(f"[beat] DM check sweep for brand={brand_name}")
-    run_agent_pipeline.delay(
-        brand_id        = brand_id,
-        brand_name      = brand_name,
-        trigger         = "scheduled_run",
-        trigger_payload = {"schedule_type": "dm"},
-        agents_to_run   = ["dm"],
-    )
+    brands = _run_async(_fetch_active_brands())
+    for brand_id, brand_name in brands:
+        run_agent_pipeline.delay(
+            brand_id=brand_id, brand_name=brand_name,
+            trigger="scheduled_run",
+            trigger_payload={"schedule_type": "dm"},
+            agents_to_run=["dm"],
+        )

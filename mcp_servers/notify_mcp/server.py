@@ -50,6 +50,35 @@ from fastmcp import FastMCP
 
 load_dotenv()
 
+
+# ── Multi-tenant credential fetching ─────────────────────────────────────────
+# MCP servers are shared across all brands.
+# Each tool receives brand_id and fetches credentials from Redis.
+
+import redis.asyncio as _aioredis
+
+_REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+
+async def _get_brand_creds(brand_id: str) -> dict:
+    """
+    Fetch decrypted brand credentials from Redis.
+    The main API writes these when a brand is created or credentials are updated.
+    Raises ValueError if brand_id is not found in cache — caller returns an error response.
+    """
+    r = _aioredis.from_url(_REDIS_URL, decode_responses=True)
+    try:
+        raw = await r.get(f"fashionos:creds:{brand_id}")
+        if not raw:
+            raise ValueError(
+                f"No credentials found for brand_id='{brand_id}'. "
+                "Ensure the brand exists and POST /api/v1/brands was called first."
+            )
+        import json as _json
+        return _json.loads(raw)
+    finally:
+        await r.aclose()
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 META_WHATSAPP_TOKEN      = os.getenv("META_WHATSAPP_TOKEN", "")
@@ -80,6 +109,8 @@ mcp = FastMCP(
 )
 
 
+
+
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 async def _whatsapp_post(to: str, message: str) -> dict:
@@ -94,6 +125,7 @@ async def _whatsapp_post(to: str, message: str) -> dict:
     Returns raw API response dict.
     Raises httpx.HTTPStatusError on non-2xx so caller can catch and return error record.
     """
+
     if not META_WHATSAPP_TOKEN:
         raise ValueError("META_WHATSAPP_TOKEN not set. Add it to mcp_servers/notify_mcp/.env")
     if not WHATSAPP_PHONE_NUMBER_ID:
@@ -156,15 +188,15 @@ async def _resend_post(payload: dict) -> dict:
 # ── TOOLS ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def send_whatsapp_message(to: str, message: str) -> dict:
+async def send_whatsapp_message(to: str, msg_body: str) -> dict:
     """
     Send a WhatsApp message via Meta Cloud API to any recipient.
 
     Args:
-        to:      Recipient phone number in international format WITHOUT the + prefix.
-                 Pakistan: 923001234567
-                 A leading + is automatically stripped if present.
-        message: Message text. Max 4096 chars (Meta limit).
+        to:       Recipient phone number in international format WITHOUT the + prefix.
+                  Pakistan: 923001234567
+                  A leading + is automatically stripped if present.
+        msg_body: Message text. Max 4096 chars (Meta limit).
 
     Returns:
         {"success": true, "message_id": "wamid.XXXX", "to": "923001234567", "sent_at": "..."}
@@ -175,7 +207,7 @@ async def send_whatsapp_message(to: str, message: str) -> dict:
     Used by: Supervisor send_notifications node for DM flag alerts.
     """
     try:
-        result    = await _whatsapp_post(to, message)
+        result    = await _whatsapp_post(to, msg_body)
         # Meta response: {"messages": [{"id": "wamid.XXXX"}], "contacts": [...]}
         message_id = result.get("messages", [{}])[0].get("id", "")
         return {
@@ -189,37 +221,43 @@ async def send_whatsapp_message(to: str, message: str) -> dict:
 
 
 @mcp.tool()
-async def send_critical_alert(message: str, sku: Optional[str] = None) -> dict:
+async def send_critical_alert(brand_id: str, alert_body: str, sku: Optional[str] = None) -> dict:
     """
     Send a critical alert WhatsApp to the brand owner (BRAND_OWNER_WHATSAPP env var).
 
-    Pre-formats the message with a ⚠️ header and brand name.
+    Pre-formats the alert_body with a ⚠️ header and brand name.
     Recipient is read from BRAND_OWNER_WHATSAPP env var — no need to pass a number.
 
     Args:
-        message: Alert body. Be specific: include SKU, numbers, action needed.
-        sku:     Optional SKU this alert relates to (included in header if provided).
+        alert_body: Alert body. Be specific: include SKU, numbers, action needed.
+        sku:        Optional SKU this alert relates to (included in header if provided).
 
     Returns success dict (same shape as send_whatsapp_message).
 
     Used by: Supervisor send_notifications for stockouts, quality issues,
              high-priority DM flags (bulk_inquiry, complaint).
     """
-    if not BRAND_OWNER_WHATSAPP:
-        return {"success": False, "error": "BRAND_OWNER_WHATSAPP not configured in .env"}
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    owner_whatsapp = creds.get("brand_owner_whatsapp", "")
+    brand_name     = creds.get("brand_name", brand_id)
 
     sku_tag   = f" [{sku}]" if sku else ""
     formatted = (
-        f"⚠️ *{BRAND_NAME} — Critical Alert*{sku_tag}\n\n"
-        f"{message}\n\n"
+        f"⚠️ *{brand_name} — Critical Alert*{sku_tag}\n\n"
+        f"{alert_body}\n\n"
         f"_{datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')}_"
     )
 
-    return await send_whatsapp_message(BRAND_OWNER_WHATSAPP, formatted)
+    return await send_whatsapp_message(owner_whatsapp, formatted)
 
 
 @mcp.tool()
 async def send_restock_whatsapp(
+    brand_id:         str,
     supplier_number:  str,
     sku:              str,
     product_title:    str,
@@ -249,18 +287,25 @@ async def send_restock_whatsapp(
 
     # ── 2. Confirm to brand owner ──────────────────────────────────────────────
     owner_notified = False
-    if BRAND_OWNER_WHATSAPP:
-        status_icon = "✅" if supplier_result.get("success") else "❌"
-        owner_msg   = (
-            f"📦 *Restock Order {status_icon}*\n\n"
-            f"SKU: {sku}\n"
-            f"Product: {product_title}\n"
-            f"Quantity: {quantity} units\n"
-            f"Supplier: {supplier_number}\n\n"
-            f"_{datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')}_"
-        )
-        owner_result  = await send_whatsapp_message(BRAND_OWNER_WHATSAPP, owner_msg)
-        owner_notified = owner_result.get("success", False)
+
+    try:
+        creds          = await _get_brand_creds(brand_id)
+        owner_number   = creds.get("brand_owner_whatsapp", "")
+        brand_name     = creds.get("brand_name", brand_id)
+        if owner_number:
+            status_icon = "✅" if supplier_result.get("success") else "❌"
+            owner_msg   = (
+                f"📦 *Restock Order {status_icon}*\n\n"
+                f"SKU: {sku}\n"
+                f"Product: {product_title}\n"
+                f"Quantity: {quantity} units\n"
+                f"Supplier: {supplier_number}\n\n"
+                f"_{datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')}_"
+            )
+            owner_result  = await send_whatsapp_message(owner_number, owner_msg)
+            owner_notified = owner_result.get("success", False)
+    except Exception as exc:
+        print(f"[notify-mcp] Owner confirmation failed: {exc}")
 
     return {
         "success":           supplier_result.get("success", False),
@@ -275,6 +320,7 @@ async def send_restock_whatsapp(
 
 @mcp.tool()
 async def send_daily_digest(
+    brand_id:        str,
     run_summary:     str,
     critical_count:  int,
     warning_count:   int,
@@ -300,8 +346,16 @@ async def send_daily_digest(
 
     Used by: Supervisor send_notifications node at end of daily sweep.
     """
-    if not BRAND_OWNER_EMAIL:
-        return {"success": False, "error": "BRAND_OWNER_EMAIL not configured in .env"}
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    owner_email = creds.get("brand_owner_email", "")
+    brand_name  = creds.get("brand_name", brand_id)
+
+    if not owner_email:
+        return {"success": False, "error": f"brand_owner_email not set for brand_id='{brand_id}'"}
 
     now      = datetime.now(timezone.utc)
     date_str = now.strftime("%A, %d %B %Y")
@@ -323,7 +377,7 @@ async def send_daily_digest(
 <body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; color: #111;">
 
   <h2 style="color: #111; border-bottom: 2px solid #f3f4f6; padding-bottom: 12px;">
-    🤖 {BRAND_NAME} — Daily AI Run Report<br>
+    🤖 {brand_name} — Daily AI Run Report<br>
     <span style="font-size: 14px; font-weight: normal; color: #6b7280;">{date_str}</span>
   </h2>
 
@@ -371,20 +425,20 @@ async def send_daily_digest(
 
     try:
         result = await _resend_post({
-            "from":    f"{BRAND_NAME} AI <digest@{os.getenv('RESEND_FROM_DOMAIN', 'fashionos.ai')}>",
-            "to":      [BRAND_OWNER_EMAIL],
-            "subject": f"[{BRAND_NAME}] Daily AI Report — {alert_text}",
+            "from":    f"{brand_name} AI <digest@{os.getenv('RESEND_FROM_DOMAIN', 'fashionos.ai')}>",
+            "to":      [owner_email],
+            "subject": f"[{brand_name}] Daily AI Report — {alert_text}",
             "html":    html_body,
             "text":    text_body,
         })
         return {
             "success":  True,
             "email_id": result.get("id"),
-            "to":       BRAND_OWNER_EMAIL,
+            "to":       owner_email,
             "sent_at":  datetime.now(timezone.utc).isoformat(),
         }
     except Exception as exc:
-        return {"success": False, "error": str(exc), "to": BRAND_OWNER_EMAIL}
+        return {"success": False, "error": str(exc), "to": owner_email}
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

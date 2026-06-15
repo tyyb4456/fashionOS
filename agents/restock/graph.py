@@ -488,6 +488,7 @@ async def execute_restock_actions(state: RestockAgentState) -> dict:
                     "units_per_day":           d.units_per_day,
                     "reason":                  d.reason,
                     "supplier_message":        d.supplier_message,
+                    "brand_id": state["brand_id"],
                 })
                 _parse_mcp_result(raw)  # validate parseable; result not used directly
             except Exception as exc:

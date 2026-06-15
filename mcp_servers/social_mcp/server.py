@@ -29,6 +29,34 @@ from fastmcp import FastMCP
 
 load_dotenv()
 
+# ── Multi-tenant credential fetching ─────────────────────────────────────────
+# MCP servers are shared across all brands.
+# Each tool receives brand_id and fetches credentials from Redis.
+
+import redis.asyncio as _aioredis
+
+_REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+
+async def _get_brand_creds(brand_id: str) -> dict:
+    """
+    Fetch decrypted brand credentials from Redis.
+    The main API writes these when a brand is created or credentials are updated.
+    Raises ValueError if brand_id is not found in cache — caller returns an error response.
+    """
+    r = _aioredis.from_url(_REDIS_URL, decode_responses=True)
+    try:
+        raw = await r.get(f"fashionos:creds:{brand_id}")
+        if not raw:
+            raise ValueError(
+                f"No credentials found for brand_id='{brand_id}'. "
+                "Ensure the brand exists and POST /api/v1/brands was called first."
+            )
+        import json as _json
+        return _json.loads(raw)
+    finally:
+        await r.aclose()
+
 # ── Apify config (scraping) ───────────────────────────────────────────────────
 
 APIFY_TOKEN    = os.getenv("APIFY_API_TOKEN", "")
@@ -40,8 +68,6 @@ SCRAPE_TIMEOUT     = int(os.getenv("APIFY_SCRAPE_TIMEOUT_SECONDS", "90"))
 
 # ── Instagram Graph API config (DMs) ─────────────────────────────────────────
 
-INSTAGRAM_PAGE_ID      = os.getenv("INSTAGRAM_PAGE_ID", "")
-INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
 IG_GRAPH_VERSION       = os.getenv("INSTAGRAM_GRAPH_API_VERSION", "v21.0")
 IG_BASE_URL            = f"https://graph.facebook.com/{IG_GRAPH_VERSION}"
 
@@ -77,25 +103,35 @@ async def _run_actor_sync(actor_id: str, run_input: dict, limit: int = 20) -> li
 
 # ── Instagram Graph API helpers ───────────────────────────────────────────────
 
-async def _ig_get(path: str, params: dict | None = None) -> dict:
+async def _ig_get(brand_id: str, path: str, params: dict | None = None) -> dict:
     """GET to Instagram Graph API."""
-    if not INSTAGRAM_ACCESS_TOKEN:
-        raise ValueError("INSTAGRAM_ACCESS_TOKEN not set in social-mcp .env")
-    all_params = {"access_token": INSTAGRAM_ACCESS_TOKEN, **(params or {})}
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    
+    token = creds["instagram_access_token"]
+
+    all_params = {"access_token": token, **(params or {})}
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(f"{IG_BASE_URL}/{path}", params=all_params)
         r.raise_for_status()
         return r.json()
 
 
-async def _ig_post(path: str, payload: dict) -> dict:
+async def _ig_post(brand_id: str, path: str, payload: dict) -> dict:
     """POST to Instagram Graph API."""
-    if not INSTAGRAM_ACCESS_TOKEN:
-        raise ValueError("INSTAGRAM_ACCESS_TOKEN not set in social-mcp .env")
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    
+    token = creds["instagram_access_token"]
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(
             f"{IG_BASE_URL}/{path}",
-            params={"access_token": INSTAGRAM_ACCESS_TOKEN},
+            params={"access_token": token},
             json=payload,
         )
         r.raise_for_status()
@@ -246,7 +282,7 @@ async def get_trending_tiktok_sounds(limit: int = 10) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def get_instagram_dms(limit: int = 20) -> list[dict]:
+async def get_instagram_dms(brand_id: str, limit: int = 20) -> list[dict]:
     """
     Get recent Instagram DM conversations that need a reply.
 
@@ -267,12 +303,18 @@ async def get_instagram_dms(limit: int = 20) -> list[dict]:
 
     Used by: DM Agent (Node 1 — fetch_dm_data)
     """
-    if not INSTAGRAM_PAGE_ID or not INSTAGRAM_ACCESS_TOKEN:
-        return [{"error": "INSTAGRAM_PAGE_ID or INSTAGRAM_ACCESS_TOKEN not configured", "source": "instagram_dm"}]
+
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    
+    page_id = creds['instagram_page_id']
 
     try:
         data = await _ig_get(
-            f"{INSTAGRAM_PAGE_ID}/conversations",
+            f"{page_id}/conversations",
             {
                 "platform": "instagram",
                 "fields":   "id,updated_time,participants",
@@ -307,12 +349,12 @@ async def get_instagram_dms(limit: int = 20) -> list[dict]:
         # Identify the customer (the participant who isn't us)
         participants = conv.get("participants", {}).get("data", [])
         customer = next(
-            (p for p in participants if str(p.get("id")) != str(INSTAGRAM_PAGE_ID)),
+            (p for p in participants if str(p.get("id")) != str(page_id)),
             {},
         )
 
         # needs_reply = True if customer sent the last message (not us)
-        we_sent_last = (sender_id == str(INSTAGRAM_PAGE_ID))
+        we_sent_last = (sender_id == str(page_id))
 
         results.append({
             "conversation_id": conv_id,
@@ -329,13 +371,13 @@ async def get_instagram_dms(limit: int = 20) -> list[dict]:
 
 
 @mcp.tool()
-async def send_instagram_dm(user_id: str, message: str) -> dict:
+async def send_instagram_dm(brand_id: str, user_id: str, reply_text: str) -> dict:
     """
     Send a DM reply to an Instagram user.
 
     Args:
-        user_id: Customer's Instagram PSID from get_instagram_dms output.
-        message: Reply text (max 1000 chars — Instagram limit).
+        user_id:    Customer's Instagram PSID from get_instagram_dms output.
+        reply_text: Reply text (max 1000 chars — Instagram limit).
 
     Returns success confirmation with message_id.
     On error: {"success": false, "error": "...", "user_id": user_id}
@@ -346,15 +388,25 @@ async def send_instagram_dm(user_id: str, message: str) -> dict:
 
     Used by: DM Agent (Node 4 — send_dm_replies)
     """
-    if not INSTAGRAM_ACCESS_TOKEN:
+
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    
+    token = creds["instagram_access_token"]
+
+    if not token:
         return {"success": False, "error": "INSTAGRAM_ACCESS_TOKEN not configured", "user_id": user_id}
 
     try:
         result = await _ig_post(
+            brand_id,
             "me/messages",
             {
                 "recipient": {"id": user_id},
-                "message":   {"text": message[:1000]},
+                "message":   {"text": reply_text[:1000]},
             },
         )
         return {
@@ -373,6 +425,7 @@ async def send_instagram_dm(user_id: str, message: str) -> dict:
 
 @mcp.tool()
 async def get_instagram_comments(
+    brand_id: str,
     media_id: str,
     limit:    int = 20,
 ) -> list[dict]:
@@ -396,8 +449,15 @@ async def get_instagram_comments(
     if not media_id or not media_id.strip():
         return [{"error": "media_id is required and cannot be empty", "source": "instagram_comments"}]
 
-        
-    if not INSTAGRAM_ACCESS_TOKEN:
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    
+    token = creds["instagram_access_token"]
+
+    if not token:
         return [{"error": "INSTAGRAM_ACCESS_TOKEN not configured", "source": "instagram_comments"}]
 
     try:

@@ -20,7 +20,9 @@ RUN apt-get update \
 
 # Python deps first — this layer is cached unless requirements.txt changes
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install \
+    --default-timeout=300 \
+    -r requirements.txt
 
 # Copy entrypoint script
 COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh

@@ -344,6 +344,7 @@ async def send_notifications(state: FashionOSState) -> dict:
     """
     trigger       = state.get("trigger", "manual")
     schedule_type = state.get("trigger_payload", {}).get("schedule_type", "")
+    brand_id      = state.get("brand_id", "unknown_brand")
 
     # Skip notifications for hourly and dm-check sweeps
     if trigger == "scheduled_run" and schedule_type in ("hourly", "dm"):
@@ -380,8 +381,9 @@ async def send_notifications(state: FashionOSState) -> dict:
 
         try:
             raw = await tool_map["send_critical_alert"].ainvoke({
-                "message": msg,
-                "sku":     critical[0].get("sku"),
+                "brand_id":   brand_id,
+                "alert_body": msg,
+                "sku":        critical[0].get("sku"),
             })
             result = _parse_mcp_result(raw)
             if isinstance(result, dict) and result.get("success"):
@@ -401,10 +403,16 @@ async def send_notifications(state: FashionOSState) -> dict:
                 f"Reply via Instagram DMs."
             )
             try:
-                owner_number = os.getenv("BRAND_OWNER_WHATSAPP", "")
-                if owner_number:
-                    await tool_map["send_whatsapp_message"].ainvoke({"to": owner_number, "message": msg})
+                raw = await tool_map["send_critical_alert"].ainvoke({
+                    "brand_id":   brand_id,
+                    "alert_body": msg,
+                    "sku":        None,
+                })
+                result = _parse_mcp_result(raw)
+                if isinstance(result, dict) and result.get("success"):
                     print(f"[Supervisor] ✓ DM flag WhatsApp sent: @{dm.get('username')} [{dm.get('category')}]")
+                else:
+                    print(f"[Supervisor] ✗ DM flag WhatsApp failed: {result}")
             except Exception as exc:
                 print(f"[Supervisor] ✗ DM flag WhatsApp error: {exc}")
 
@@ -460,6 +468,7 @@ async def send_notifications(state: FashionOSState) -> dict:
 
         try:
             raw = await tool_map["send_daily_digest"].ainvoke({
+                "brand_id":        brand_id, 
                 "run_summary":     state.get("run_summary", "Run completed."),
                 "critical_count":  len(critical),
                 "warning_count":   warning_count,

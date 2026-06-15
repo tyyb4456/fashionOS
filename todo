@@ -1,0 +1,88 @@
+- add authentication -- signup/login 
+
+# PROMPT
+
+bro see, instead of user manually add their access secret tokens -- what if we add OAuth where the user redirect to facebook/meta or shopify and got the secrets -- the file i uploaded has an idea -- how to actually do this 
+
+now see when the user redirect to and got the secrets -- is their really need of api key to generate for every user  -- as we are adding clerk authentication 
+
+so what u think
+
+if this is a good idea 
+
+then dont touch the frontend for now and only focus on backend and refactor the code, whatever changes are required
+
+
+
+---
+
+Questions to ask 
+
+- when there is multiple servers are there in the backend and so many users can query and there is only one database that is connected to all servers how does it work -- i mean if there is multiple requests for writing or reading data in the DB -- then is the dB crash -- how system designer solve this problem 
+
+- what is api gateway -- is it use in only microservices 
+
+
+
+# PROMPT 
+
+See, brother, I refactored the code from a single user to a multi-user 
+
+
+
+In this situation, the user adds the access tokens manually, gets the api key, and then  gets the brand's info, and based on the unique brand ID -- the MCP servers get the credentials of the user and perform the task for the user 
+
+
+
+So there is separate data in the DB for all the users -- not all users will see the same data as before this 
+
+
+
+
+
+But now the problem is 
+
+
+
+The user cannot manually get the secret tokens from the Shopify and Meta platforms and then add secrets there 
+
+
+
+So, for this, the solution is OAuth 
+
+
+
+e.g., example for connecting to meta 
+
+
+
+User clicks "Connect Meta."
+
+        ↓
+
+Redirect → Meta OAuth (Facebook Login)
+
+        ↓
+
+User approves permissions (ads, Instagram, pages)
+
+        ↓
+
+Your backend gets access_token
+
+        ↓
+
+Store in DB per user
+
+        ↓
+
+Your custom ads-mcp / social-mcp uses that token
+
+to call the Graph API on their behalf
+
+
+
+
+
+Same thing with Shopify to get the access token and webhook secret 
+

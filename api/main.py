@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routers import webhooks
 from api.routers import runs
 from api.routers import approvals   # NEW session 8
+from api.routers import webhooks, runs, brands 
 
 APP_VERSION = "0.2.0"
 BRAND_NAME  = os.getenv("BRAND_NAME", "FashionOS Brand")
@@ -70,7 +71,8 @@ app.add_middleware(
 
 app.include_router(webhooks.router)
 app.include_router(runs.router)
-app.include_router(approvals.router)   # NEW session 8
+app.include_router(approvals.router)   
+app.include_router(brands.router) 
 
 
 @app.get("/health", tags=["ops"])

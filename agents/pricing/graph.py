@@ -283,13 +283,13 @@ async def fetch_pricing_data(state: PricingAgentState) -> dict:
     tool_map = {t.name: t for t in tools}
 
     products_raw = await tool_map["list_products"].ainvoke(
-        {"limit": 250, "status": "active"}
+        {"limit": 250, "status": "active", "brand_id": state["brand_id"]}
     )
     velocity_raw = await tool_map["calculate_sales_velocity"].ainvoke(
-        {"days": 14}
+        {"days": 14, "brand_id": state["brand_id"]}
     )
     rules_raw = await tool_map["get_price_rules"].ainvoke(
-        {"active_only": True}
+        {"active_only": True, "brand_id": state["brand_id"]}
     )
 
     products      = _parse_mcp_result(products_raw)
@@ -537,6 +537,7 @@ async def execute_pricing_actions(state: PricingAgentState) -> dict:
                     "new_price":        d.recommended_price,
                     "compare_at_price": d.new_compare_at_price,
                     "reason":           f"[AUTO] {d.reason}",
+                    "brand_id": state["brand_id"],
                 })
                 auto_count += 1
                 print(

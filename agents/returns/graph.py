@@ -216,7 +216,7 @@ async def fetch_return_data(state: ReturnsAgentState) -> dict:
 
     if "get_returns" in tool_map:
         try:
-            raw = await tool_map["get_returns"].ainvoke({"days": RETURNS_LOOKBACK_DAYS})
+            raw = await tool_map["get_returns"].ainvoke({"days": RETURNS_LOOKBACK_DAYS, "brand_id": state["brand_id"]})
             raw_returns = _parse_mcp_result(raw)
             if not isinstance(raw_returns, list):
                 raw_returns = []

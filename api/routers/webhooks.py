@@ -1,185 +1,101 @@
 """
-FashionOS — Shopify Webhook Router
-===================================
-Receives Shopify webhook POSTs, verifies their HMAC signature,
-then dispatches an async Celery task. Returns 200 in < 200ms.
-
-Registered endpoints:
-  POST /api/v1/webhooks/shopify/{topic}
-
-Shopify sends webhooks for:
-  orders/paid               → inventory agent run
-  orders/cancelled          → inventory agent run (stock restored)
-  inventory_levels/update   → inventory agent run
-  products/create           → inventory agent run
-  products/update           → inventory agent run
-
-Setup (in Shopify admin or via shopify-mcp in the future):
-  1. Go to Admin → Notifications → Webhooks
-  2. Add webhook for each topic above
-  3. URL: https://your-domain.com/api/v1/webhooks/shopify/orders_paid
-  4. Secret: must match SHOPIFY_WEBHOOK_SECRET in .env
+Shopify Webhook Router — multi-tenant.
+URL per brand: POST /api/v1/webhooks/shopify/{brand_id}/{topic}
+HMAC uses that brand's own webhook secret from Redis.
 """
 
-import hashlib
-import hmac
-import json
-import os
-import base64
+import hashlib, hmac, json, os, base64
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
-
+from api.auth import get_current_brand
 from api.workers.tasks import run_agent_pipeline
+from db.models import Brand
+from db.session import get_session
+import redis.asyncio as aioredis
+
+router  = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
-router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
+async def _get_brand(brand_id: str, session: AsyncSession) -> Brand | None:
+    return (await session.execute(
+        select(Brand).where(Brand.brand_id == brand_id, Brand.is_active == True)  # noqa: E712
+    )).scalar_one_or_none()
 
-SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
-BRAND_ID               = os.getenv("BRAND_ID",               "default-brand")
-BRAND_NAME             = os.getenv("BRAND_NAME",             "FashionOS Brand")
+
+async def _webhook_secret(brand_id: str) -> str:
+    r = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        raw = await r.get(f"fashionos:creds:{brand_id}")
+        return json.loads(raw).get("shopify_webhook_secret", "") if raw else ""
+    finally:
+        await r.aclose()
 
 
-# ── HMAC verification ─────────────────────────────────────────────────────────
-
-def _verify_shopify_hmac(raw_body: bytes, hmac_header: str) -> bool:
-    """
-    Verifies the X-Shopify-Hmac-Sha256 header against the raw request body.
-
-    Shopify signs every webhook with HMAC-SHA256 using your webhook secret.
-    We must verify this BEFORE touching the payload — it's the only guarantee
-    the request is actually from Shopify and not a spoofed attacker.
-
-    Returns True if valid, False if not.
-    Deliberately returns bool (not raises) so the caller controls the 401.
-    """
-    if not SHOPIFY_WEBHOOK_SECRET:
-        # No secret configured — skip verification in dev, fail in prod
-        if os.getenv("ENV", "development") == "production":
-            return False
-        return True   # dev: pass through
-
-    digest = hmac.new(
-        SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).digest()
-
-    computed = base64.b64encode(digest).decode("utf-8")
+def _verify(raw_body: bytes, hmac_header: str, secret: str) -> bool:
+    if not secret:
+        return os.getenv("ENV", "development") != "production"
+    computed = base64.b64encode(
+        hmac.new(secret.encode(), raw_body, hashlib.sha256).digest()
+    ).decode()
     return hmac.compare_digest(computed, hmac_header)
 
 
-# ── Webhook endpoint ──────────────────────────────────────────────────────────
-
-@router.post(
-    "/shopify/{topic_path:path}",
-    status_code=status.HTTP_200_OK,
-    summary="Receive Shopify webhook",
-    description=(
-        "Shopify sends a POST here whenever a subscribed event fires. "
-        "We verify the HMAC signature, then push the event to Celery. "
-        "Must return 200 within 5 seconds or Shopify will retry."
-    ),
-)
-async def shopify_webhook(
-    topic_path: str,
-    request:    Request,
-    x_shopify_topic:       str = Header(..., alias="X-Shopify-Topic"),
-    x_shopify_hmac_sha256: str = Header(..., alias="X-Shopify-Hmac-Sha256"),
-    x_shopify_shop_domain: str = Header("", alias="X-Shopify-Shop-Domain"),
-):
-    """
-    topic_path examples:
-      orders/paid           (from URL path)
-    x_shopify_topic:
-      orders/paid           (from Shopify header — should match path)
-
-    We use the header as the canonical topic (Shopify guarantees it).
-    """
-    # ── 1. Read raw body (needed for HMAC verification before parsing) ────────
-    raw_body = await request.body()
-
-    # ── 2. Verify HMAC ────────────────────────────────────────────────────────
-    if not _verify_shopify_hmac(raw_body, x_shopify_hmac_sha256):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid webhook signature. Request rejected.",
-        )
-
-    # ── 3. Parse JSON payload ─────────────────────────────────────────────────
-    try:
-        payload = json.loads(raw_body)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Webhook body is not valid JSON.",
-        )
-
-    topic = x_shopify_topic   # e.g. "orders/paid"
-
-    # ── 4. Dispatch Celery task (non-blocking) ────────────────────────────────
-    task = run_agent_pipeline.delay(
-        brand_id        = BRAND_ID,
-        brand_name      = BRAND_NAME,
-        trigger         = "shopify_webhook",
-        trigger_payload = {
-            "topic":       topic,
-            "shop_domain": x_shopify_shop_domain,
-            # Include key IDs for traceability (not the full payload — too large)
-            "order_id":    payload.get("id"),
-            "order_name":  payload.get("name"),          # e.g. "#1042"
-            "sku_hint":    _extract_sku_hint(payload),   # first SKU if present
-        },
-    )
-
-    return {
-        "received":  True,
-        "topic":     topic,
-        "task_id":   task.id,
-        "message":   f"Webhook accepted. Agent pipeline dispatched (task={task.id}).",
-    }
-
-
-def _extract_sku_hint(payload: dict) -> str | None:
-    """
-    Pull the first SKU from a Shopify order payload for logging/tracing.
-    Non-critical — returns None if structure doesn't match.
-    """
+def _sku_hint(payload: dict) -> str | None:
     try:
         return payload["line_items"][0]["sku"]
     except (KeyError, IndexError, TypeError):
         return None
 
 
-# ── Manual trigger endpoint ───────────────────────────────────────────────────
+@router.post("/shopify/{brand_id}/{topic_path:path}", status_code=200)
+async def shopify_webhook(
+    brand_id:   str,
+    topic_path: str,
+    request:    Request,
+    session:    AsyncSession = Depends(get_session),
+    x_shopify_topic:       str = Header(..., alias="X-Shopify-Topic"),
+    x_shopify_hmac_sha256: str = Header(..., alias="X-Shopify-Hmac-Sha256"),
+    x_shopify_shop_domain: str = Header("",  alias="X-Shopify-Shop-Domain"),
+):
+    brand = await _get_brand(brand_id, session)
+    if not brand:
+        raise HTTPException(404, f"Brand '{brand_id}' not found.")
 
-@router.post(
-    "/manual-run",
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Manually trigger an agent pipeline run",
-    description=(
-        "Triggers the full supervisor pipeline manually. "
-        "Useful for testing, dashboard 'Run now' buttons, and one-off sweeps."
-    ),
-)
+    raw_body = await request.body()
+
+    if not _verify(raw_body, x_shopify_hmac_sha256, await _webhook_secret(brand_id)):
+        raise HTTPException(401, "Invalid webhook signature.")
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON.")
+
+    task = run_agent_pipeline.delay(
+        brand_id        = brand_id,
+        brand_name      = brand.brand_name,
+        trigger         = "shopify_webhook",
+        trigger_payload = {
+            "topic":       x_shopify_topic,
+            "shop_domain": x_shopify_shop_domain,
+            "order_id":    payload.get("id"),
+            "order_name":  payload.get("name"),
+            "sku_hint":    _sku_hint(payload),
+        },
+    )
+    return {"received": True, "brand_id": brand_id, "topic": x_shopify_topic, "task_id": task.id}
+
+
+@router.post("/manual-run", status_code=202)
 async def manual_run(
     agents: list[str] | None = None,
+    brand:  Brand = Depends(get_current_brand),
 ):
-    """
-    agents: Optional explicit list of agents to run.
-            e.g. ["inventory"]
-            If omitted, supervisor routing table decides.
-    """
     task = run_agent_pipeline.delay(
-        brand_id        = BRAND_ID,
-        brand_name      = BRAND_NAME,
-        trigger         = "manual",
-        trigger_payload = {},
-        agents_to_run   = agents,
+        brand_id=brand.brand_id, brand_name=brand.brand_name,
+        trigger="manual", trigger_payload={}, agents_to_run=agents,
     )
-
-    return {
-        "accepted":     True,
-        "task_id":      task.id,
-        "agents":       agents or "supervisor will decide",
-        "message":      f"Manual run dispatched (task={task.id}).",
-    }
+    return {"accepted": True, "brand_id": brand.brand_id, "task_id": task.id}

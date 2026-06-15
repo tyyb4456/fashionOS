@@ -209,7 +209,7 @@ async def fetch_dm_data(state: DmAgentState) -> dict:
         return {"raw_dms": []}
 
     try:
-        raw = await tool_map["get_instagram_dms"].ainvoke({"limit": DM_FETCH_LIMIT})
+        raw = await tool_map["get_instagram_dms"].ainvoke({"limit": DM_FETCH_LIMIT, "brand_id": state["brand_id"]})
         result = _parse_mcp_result(raw)
 
         if isinstance(result, list) and result and "error" in result[0]:
@@ -393,6 +393,7 @@ async def send_dm_replies(state: DmAgentState) -> dict:
                 raw = await tool_map["send_instagram_dm"].ainvoke({
                     "user_id": d.user_id,
                     "message": d.reply_text,
+                    "brand_id": state["brand_id"]
                 })
                 result = _parse_mcp_result(raw)
 

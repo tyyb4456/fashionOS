@@ -36,10 +36,36 @@ from fastmcp import FastMCP
 
 load_dotenv()
 
+# ── Multi-tenant credential fetching ─────────────────────────────────────────
+# MCP servers are shared across all brands.
+# Each tool receives brand_id and fetches credentials from Redis.
+
+import redis.asyncio as _aioredis
+
+_REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+
+async def _get_brand_creds(brand_id: str) -> dict:
+    """
+    Fetch decrypted brand credentials from Redis.
+    The main API writes these when a brand is created or credentials are updated.
+    Raises ValueError if brand_id is not found in cache — caller returns an error response.
+    """
+    r = _aioredis.from_url(_REDIS_URL, decode_responses=True)
+    try:
+        raw = await r.get(f"fashionos:creds:{brand_id}")
+        if not raw:
+            raise ValueError(
+                f"No credentials found for brand_id='{brand_id}'. "
+                "Ensure the brand exists and POST /api/v1/brands was called first."
+            )
+        import json as _json
+        return _json.loads(raw)
+    finally:
+        await r.aclose()
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
-META_ACCESS_TOKEN  = os.getenv("META_ACCESS_TOKEN", "")
-META_AD_ACCOUNT_ID = os.getenv("META_AD_ACCOUNT_ID", "")   # e.g. "act_123456789"
 GRAPH_API_VERSION  = os.getenv("META_GRAPH_API_VERSION", "v21.0")
 BASE_URL           = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
@@ -59,27 +85,19 @@ mcp = FastMCP(
     ),
 )
 
-
-# ── HTTP helpers ───────────────────────────────────────────────────────────────
-
-async def _get(path: str, params: dict | None = None) -> dict:
-    """GET request to Meta Graph API."""
-    if not META_ACCESS_TOKEN:
-        raise ValueError("META_ACCESS_TOKEN not set. Add it to mcp_servers/ads_mcp/.env")
-
-    all_params = {"access_token": META_ACCESS_TOKEN, **(params or {})}
+async def _meta_get(brand_id: str, path: str, params: dict | None = None) -> dict:
+    creds = await _get_brand_creds(brand_id)
+    token = creds["meta_access_token"]
+    all_params = {"access_token": token, **(params or {})}
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(f"{BASE_URL}/{path}", params=all_params)
         r.raise_for_status()
         return r.json()
 
-
-async def _post(path: str, data: dict) -> dict:
-    """POST request to Meta Graph API."""
-    if not META_ACCESS_TOKEN:
-        raise ValueError("META_ACCESS_TOKEN not set. Add it to mcp_servers/ads_mcp/.env")
-
-    all_data = {"access_token": META_ACCESS_TOKEN, **data}
+async def _meta_post(brand_id: str, path: str, data: dict) -> dict:
+    creds = await _get_brand_creds(brand_id)
+    token = creds["meta_access_token"]
+    all_data = {"access_token": token, **data}
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(f"{BASE_URL}/{path}", data=all_data)
         r.raise_for_status()
@@ -109,11 +127,12 @@ def _ensure_act_prefix(account_id: str) -> str:
 # ── TOOLS ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def get_campaigns(active_only: bool = True) -> list[dict]:
+async def get_campaigns(brand_id: str, active_only: bool = True) -> list[dict]:
     """
     List all campaigns for the configured Meta ad account.
 
     Args:
+        brand_id: The brand ID for which to fetch campaigns.
         active_only: If True, returns only ACTIVE and PAUSED campaigns.
                      If False, includes DELETED and ARCHIVED too.
 
@@ -131,18 +150,19 @@ async def get_campaigns(active_only: bool = True) -> list[dict]:
 
     Used by: Marketing Agent (Node 1 — fetch_campaign_data)
     """
-    if not META_AD_ACCOUNT_ID:
-        return [{"error": "META_AD_ACCOUNT_ID not configured", "source": "meta_ads"}]
-    if not META_ACCESS_TOKEN:
-        return [{"error": "META_ACCESS_TOKEN not configured", "source": "meta_ads"}]
+    try:
+        creds = await _get_brand_creds(brand_id)
+    except ValueError as e:
+        return [{"error": str(e), "source": "meta_ads"}]
+    account_id = _ensure_act_prefix(creds["meta_ad_account_id"])
 
-    account_id = _ensure_act_prefix(META_AD_ACCOUNT_ID)
 
     # Meta expects effective_status as a JSON array string
     statuses = ["ACTIVE", "PAUSED"] if active_only else ["ACTIVE", "PAUSED", "ARCHIVED"]
 
     try:
-        data = await _get(
+        data = await _meta_get(
+            brand_id,
             f"{account_id}/campaigns",
             {
                 "fields":           "id,name,status,effective_status,daily_budget,"
@@ -173,6 +193,7 @@ async def get_campaigns(active_only: bool = True) -> list[dict]:
 
 @mcp.tool()
 async def get_campaign_performance(
+    brand_id,
     campaign_id: str,
     days:        int = 7,
 ) -> dict:
@@ -202,7 +223,8 @@ async def get_campaign_performance(
     date_preset = date_preset_map.get(days, "last_7_days")
 
     try:
-        data = await _get(
+        data = await _meta_get(
+            brand_id,
             f"{campaign_id}/insights",
             {
                 "fields":      "spend,impressions,clicks,ctr,cpc,purchase_roas,reach",
@@ -271,6 +293,7 @@ async def get_campaign_performance(
 
 @mcp.tool()
 async def update_campaign_budget(
+    brand_id,
     campaign_id:          str,
     new_daily_budget_pkr: float,
     reason:               str,
@@ -304,7 +327,7 @@ async def update_campaign_budget(
     api_budget = _pkr_to_budget(new_daily_budget_pkr)
 
     try:
-        result = await _post(campaign_id, {"daily_budget": api_budget})
+        result = await _meta_post(brand_id, campaign_id, {"daily_budget": api_budget})
         return {
             "success":              True,
             "campaign_id":          campaign_id,
@@ -322,7 +345,7 @@ async def update_campaign_budget(
 
 
 @mcp.tool()
-async def pause_campaign(campaign_id: str, reason: str) -> dict:
+async def pause_campaign(brand_id, campaign_id: str, reason: str) -> dict:
     """
     Pause a running Meta campaign immediately.
 
@@ -343,7 +366,7 @@ async def pause_campaign(campaign_id: str, reason: str) -> dict:
     Used by: Marketing Agent (Node 4 — auto-execute for out-of-stock + clearance)
     """
     try:
-        result = await _post(campaign_id, {"status": "PAUSED"})
+        result = await _meta_post(brand_id, campaign_id, {"status": "PAUSED"})
         return {
             "success":      True,
             "campaign_id":  campaign_id,
@@ -361,7 +384,7 @@ async def pause_campaign(campaign_id: str, reason: str) -> dict:
 
 
 @mcp.tool()
-async def activate_campaign(campaign_id: str, reason: str) -> dict:
+async def activate_campaign(brand_id, campaign_id: str, reason: str) -> dict:
     """
     Resume a paused Meta campaign.
 
@@ -378,7 +401,7 @@ async def activate_campaign(campaign_id: str, reason: str) -> dict:
     Used by: Marketing Agent (Node 4 — pending_approval path only)
     """
     try:
-        result = await _post(campaign_id, {"status": "ACTIVE"})
+        result = await _meta_post(brand_id, campaign_id, {"status": "ACTIVE"})
         return {
             "success":       True,
             "campaign_id":   campaign_id,

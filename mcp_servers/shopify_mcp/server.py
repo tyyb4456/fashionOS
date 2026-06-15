@@ -17,16 +17,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Multi-tenant credential fetching ─────────────────────────────────────────
+# MCP servers are shared across all brands.
+# Each tool receives brand_id and fetches credentials from Redis.
 
-SHOPIFY_SHOP  = os.getenv("SHOPIFY_SHOP_NAME")   # e.g. "my-brand" (no .myshopify.com)
-SHOPIFY_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN") # Admin API access token
-API_VERSION   = "2026-04"
-BASE_URL      = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/{API_VERSION}"
-HEADERS       = {
-    "X-Shopify-Access-Token": SHOPIFY_TOKEN,
-    "Content-Type": "application/json",
-}
+import redis.asyncio as _aioredis
+
+_REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+
+async def _get_brand_creds(brand_id: str) -> dict:
+    """
+    Fetch decrypted brand credentials from Redis.
+    The main API writes these when a brand is created or credentials are updated.
+    Raises ValueError if brand_id is not found in cache — caller returns an error response.
+    """
+    r = _aioredis.from_url(_REDIS_URL, decode_responses=True)
+    try:
+        raw = await r.get(f"fashionos:creds:{brand_id}")
+        if not raw:
+            raise ValueError(
+                f"No credentials found for brand_id='{brand_id}'. "
+                "Ensure the brand exists and POST /api/v1/brands was called first."
+            )
+        import json as _json
+        return _json.loads(raw)
+    finally:
+        await r.aclose()
+
 
 # ── FastMCP app ───────────────────────────────────────────────────────────────
 
@@ -40,30 +58,46 @@ mcp = FastMCP(
     ),
 )
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+API_VERSION = "2026-04"
 
-async def _get(endpoint: str, params: dict | None = None) -> dict:
+# Each tool now does this instead:
+async def _shopify_get(brand_id: str, endpoint: str, params: dict | None = None) -> dict:
+    creds    = await _get_brand_creds(brand_id)
+    shop     = creds["shopify_shop_name"]
+    token    = creds["shopify_access_token"]
+    base_url = f"https://{shop}.myshopify.com/admin/api/{API_VERSION}"
+    headers  = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params or {})
+        r = await client.get(f"{base_url}/{endpoint}", headers=headers, params=params or {})
         r.raise_for_status()
         return r.json()
 
-async def _put(endpoint: str, payload: dict) -> dict:
+async def _shopify_put(brand_id: str, endpoint: str, payload: dict) -> dict:
+    creds    = await _get_brand_creds(brand_id)
+    shop     = creds["shopify_shop_name"]
+    token    = creds["shopify_access_token"]
+    base_url = f"https://{shop}.myshopify.com/admin/api/{API_VERSION}"
+    headers  = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.put(f"{BASE_URL}/{endpoint}", headers=HEADERS, json=payload)
+        r = await client.put(f"{base_url}/{endpoint}", headers=headers, json=payload)
         r.raise_for_status()
         return r.json()
 
-async def _post(endpoint: str, payload: dict) -> dict:
+async def _shopify_post(brand_id: str, endpoint: str, payload: dict) -> dict:
+    creds    = await _get_brand_creds(brand_id)
+    shop     = creds["shopify_shop_name"]
+    token    = creds["shopify_access_token"]
+    base_url = f"https://{shop}.myshopify.com/admin/api/{API_VERSION}"
+    headers  = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(f"{BASE_URL}/{endpoint}", headers=HEADERS, json=payload)
+        r = await client.post(f"{base_url}/{endpoint}", headers=headers, json=payload)
         r.raise_for_status()
         return r.json()
 
 # ── READ TOOLS ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def list_products(limit: int = 50, status: str = "active") -> list[dict]:
+async def list_products(brand_id: str, limit: int = 50, status: str = "active") -> list[dict]:
     """
     List all products with their variants, prices, and live inventory levels.
 
@@ -74,11 +108,10 @@ async def list_products(limit: int = 50, status: str = "active") -> list[dict]:
     Returns a flat list — each entry is one product with its variants nested.
     Used by: Inventory Agent, Pricing Agent, Marketing Agent.
     """
-    data = await _get("products.json", {
-        "limit": limit,
-        "status": status,
-        "fields": "id,title,status,tags,variants",
-    })
+    try:
+        data = await _shopify_get(brand_id, "products.json", {"limit": limit, "status": status, "fields": "id,title,status,tags,variants"})
+    except ValueError as e:
+        return [{"error": str(e)}]
     results = []
     for p in data.get("products", []):
         results.append({
@@ -103,17 +136,22 @@ async def list_products(limit: int = 50, status: str = "active") -> list[dict]:
 
 
 @mcp.tool()
-async def get_product_by_sku(sku: str) -> Optional[dict]:
+async def get_product_by_sku(brand_id: str, sku: str) -> Optional[dict]:
     """
     Fetch a specific product variant by its SKU.
 
     Args:
+        brand_id: The ID of the brand to query. 
         sku: The exact SKU string (case-sensitive).
 
     Returns product + variant details or None if SKU not found.
     Used by: all agents when acting on a specific item.
     """
-    data = await _get("products.json", {"fields": "id,title,variants", "limit": 250})
+    try:
+        data = await _shopify_get(brand_id, "products.json", {"fields": "id,title,variants", "limit": 250})
+    except ValueError as e:
+        return {"error": str(e)}
+
     for product in data.get("products", []):
         for v in product.get("variants", []):
             if v.get("sku") == sku:
@@ -129,11 +167,12 @@ async def get_product_by_sku(sku: str) -> Optional[dict]:
     return None
 
 @mcp.tool()
-async def get_price_rules(active_only: bool = True) -> list[dict]:
+async def get_price_rules(brand_id: str, active_only: bool = True) -> list[dict]:
     """
     Fetch all price rules (discounts) currently configured in Shopify.
 
     Args:
+        brand_id: The ID of the brand to query.
         active_only: If True, only returns rules that are currently active
                      (started but not yet expired). Default True.
 
@@ -142,10 +181,13 @@ async def get_price_rules(active_only: bool = True) -> list[dict]:
     """
     from datetime import timezone  # add this import
 
-    data = await _get("price_rules.json", {
-        "limit":  250,
-        "fields": "id,title,value_type,value,starts_at,ends_at,created_at",
-    })
+    try:
+        data = await _shopify_get(brand_id, "price_rules.json", {
+            "limit":  250,
+            "fields": "id,title,value_type,value,starts_at,ends_at,created_at",
+        })
+    except ValueError as e:
+        return [{"error": str(e)}]
 
     now = datetime.now(timezone.utc)  # ← aware datetime, matches Shopify's format
 
@@ -182,11 +224,12 @@ async def get_price_rules(active_only: bool = True) -> list[dict]:
     return rules
 
 @mcp.tool()
-async def get_recent_orders(hours: int = 24, paid_only: bool = True) -> list[dict]:
+async def get_recent_orders(brand_id: str, hours: int = 24, paid_only: bool = True) -> list[dict]:
     """
     Get all orders placed in the last N hours.
 
     Args:
+        brand_id: The ID of the brand to query.
         hours:     Look-back window in hours (default 24).
         paid_only: If True, only returns paid/fulfilled orders (excludes abandoned carts).
 
@@ -202,7 +245,11 @@ async def get_recent_orders(hours: int = 24, paid_only: bool = True) -> list[dic
     if paid_only:
         params["financial_status"] = "paid"
 
-    data = await _get("orders.json", params)
+    try:
+        data = await _shopify_get(brand_id, "orders.json", params)
+    except ValueError as e:
+        return [{"error": str(e)}]
+
     orders = []
     for o in data.get("orders", []):
         orders.append({
@@ -226,23 +273,27 @@ async def get_recent_orders(hours: int = 24, paid_only: bool = True) -> list[dic
 
 
 @mcp.tool()
-async def get_returns(days: int = 30) -> list[dict]:
+async def get_returns(brand_id: str, days: int = 30) -> list[dict]:
     """
     Get all refunds and returns from the last N days.
 
     Args:
+        brand_id: The ID of the brand to query.
         days: Look-back window in days (default 30).
 
     Returns each returned line item with its SKU and any note the customer left.
     Notes are free-text reason fields — cluster them to find patterns.
     Used by: Returns Agent.
     """
-    since = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
-    data = await _get("orders.json", {
-        "created_at_min": since,
-        "limit":          250,
-        "fields":         "id,refunds,line_items",
-    })
+    since = (datetime.now() - timedelta(days=days)).isoformat() + "Z"
+    try:
+        data = await _shopify_get(brand_id, "orders.json", {
+            "created_at_min": since,
+            "limit":          250,
+            "fields":         "id,refunds,line_items",
+        })
+    except ValueError as e:
+        return [{"error": str(e)}]
 
     returns = []
     for order in data.get("orders", []):
@@ -265,24 +316,28 @@ async def get_returns(days: int = 30) -> list[dict]:
 
 
 @mcp.tool()
-async def calculate_sales_velocity(days: int = 14) -> list[dict]:
+async def calculate_sales_velocity(brand_id: str, days: int = 14) -> list[dict]:
     """
     Calculate daily units sold (velocity) per SKU over the last N days.
 
     Args:
+        brand_id: The ID of the brand to query.
         days: Period to calculate over (default 14 days).
 
     Returns SKUs sorted by velocity descending.
     This is the primary signal for stockout prediction and pricing decisions.
     Used by: Inventory Agent, Pricing Agent, Restock Agent.
     """
-    since = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
-    data = await _get("orders.json", {
-        "created_at_min":   since,
-        "financial_status": "paid",
-        "limit":            250,
-        "fields":           "line_items,created_at",
-    })
+    since = (datetime.now() - timedelta(days=days)).isoformat() + "Z"
+    try:
+        data = await _shopify_get(brand_id, "orders.json", {
+            "created_at_min":   since,
+            "financial_status": "paid",
+            "limit":            250,
+            "fields":           "line_items,created_at",
+        })
+    except ValueError as e:
+        return [{"error": str(e)}]
 
     sku_data: dict[str, dict] = {}
     for order in data.get("orders", []):
@@ -315,6 +370,7 @@ async def calculate_sales_velocity(days: int = 14) -> list[dict]:
 
 @mcp.tool()
 async def update_product_price(
+    brand_id: str,
     variant_id: int,
     new_price: float,
     compare_at_price: Optional[float],
@@ -324,6 +380,7 @@ async def update_product_price(
     Update the selling price of a specific product variant.
 
     Args:
+        brand_id:         The ID of the brand to query. 
         variant_id:       Shopify variant ID (integer).
         new_price:        New price in store currency (e.g. 2499.0 for PKR 2499).
         compare_at_price: Optional "was" price to show a strikethrough.
@@ -339,7 +396,11 @@ async def update_product_price(
     else:
         payload["variant"]["compare_at_price"] = ""
 
-    result = await _put(f"variants/{variant_id}.json", payload)
+    try:
+        result = await _shopify_put(brand_id, f"variants/{variant_id}.json", payload)
+    except ValueError as e:
+        return {"error": str(e)}
+
     v = result.get("variant", {})
     return {
         "success":          True,
@@ -353,6 +414,7 @@ async def update_product_price(
 
 @mcp.tool()
 async def set_inventory_level(
+    brand_id: str,
     inventory_item_id: int,
     location_id: int,
     available: int,
@@ -362,6 +424,7 @@ async def set_inventory_level(
     Set the available inventory quantity at a specific location.
 
     Args:
+        brand_id:          The ID of the brand to query.
         inventory_item_id: Shopify inventory item ID (from variant).
         location_id:       Shopify location ID (get from store settings).
         available:         New available quantity (absolute, not delta).
@@ -370,11 +433,14 @@ async def set_inventory_level(
     Returns success confirmation.
     Used by: Inventory Agent (corrections), Restock Agent (after delivery).
     """
-    result = await _post("inventory_levels/set.json", {
-        "inventory_item_id": inventory_item_id,
-        "location_id":       location_id,
-        "available":         available,
-    })
+    try:
+        result = await _shopify_get(brand_id, "inventory_levels/set.json", {
+            "inventory_item_id": inventory_item_id,
+            "location_id":       location_id,
+            "available":         available,
+        })
+    except ValueError as e:
+        return {"error": str(e)}
     return {
         "success":   True,
         "available": available,

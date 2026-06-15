@@ -1,0 +1,115 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FashionOS — Google Cloud Build + Cloud Run Deployment
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger:  push to main branch
+# Deploys:
+#   fashionos-api    → FastAPI, serverless (min=0, max=10)
+#   fashionos-worker → Celery worker + beat (always-on, min=1, max=1)
+# Region:   asia-south1 (Mumbai — closest to Pakistan)
+#
+# One-time GCP setup (run once before first deploy):
+#   gcloud artifacts repositories create fashionos \
+#     --repository-format=docker --location=asia-south1 \
+#     --project=$PROJECT_ID
+#
+# Required secrets in Secret Manager:
+#   fashionos-database-url       → postgresql+asyncpg://...
+#   fashionos-redis-url          → redis://...
+#   fashionos-brand-id           → your-brand-id
+#   fashionos-brand-name         → YourBrandName
+#   fashionos-shopify-shop       → your-shop (no .myshopify.com)
+#   fashionos-shopify-token      → shpat_...
+#   fashionos-webhook-secret     → your-webhook-secret
+#   fashionos-apify-token        → apify_api_...
+#   fashionos-meta-token         → your-meta-system-user-token
+#   fashionos-meta-account       → act_your-ad-account-id
+#   fashionos-instagram-token    → your-instagram-page-token
+#   fashionos-instagram-page     → your-facebook-page-id
+#   fashionos-gemini-key         → your-google-ai-studio-key
+# ─────────────────────────────────────────────────────────────────────────────
+
+substitutions:
+  _REGION: asia-south1
+  _IMAGE:  asia-south1-docker.pkg.dev/$PROJECT_ID/fashionos/app
+
+steps:
+  # ── 1. Build ────────────────────────────────────────────────────────────────
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_IMAGE}:${COMMIT_SHA}
+      - -t
+      - ${_IMAGE}:latest
+      - .
+
+  # ── 2. Push ─────────────────────────────────────────────────────────────────
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_IMAGE}
+    waitFor: [build]
+
+  # ── 3. Deploy API (serverless, public) ──────────────────────────────────────
+  # Uses bash entrypoint so we can use shell line continuation (\) for the
+  # long --update-secrets flag without YAML multiline folding issues.
+  # Note: use $$VAR (double $) to escape Cloud Build's own substitution.
+  - id: deploy-api
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud run deploy fashionos-api \
+          --image=${_IMAGE}:${COMMIT_SHA} \
+          --region=${_REGION} \
+          --platform=managed \
+          --port=8080 \
+          --allow-unauthenticated \
+          --min-instances=0 \
+          --max-instances=10 \
+          --memory=1Gi \
+          --cpu=1 \
+          --timeout=300 \
+          --concurrency=80 \
+          --args=api \
+          --set-env-vars=GOOGLE_CLOUD_PROJECT=$$PROJECT_ID,ENV=production \
+          --update-secrets=DATABASE_URL=fashionos-database-url:latest,REDIS_URL=fashionos-redis-url:latest,BRAND_ID=fashionos-brand-id:latest,BRAND_NAME=fashionos-brand-name:latest,SHOPIFY_SHOP_NAME=fashionos-shopify-shop:latest,SHOPIFY_ACCESS_TOKEN=fashionos-shopify-token:latest,SHOPIFY_WEBHOOK_SECRET=fashionos-webhook-secret:latest,GOOGLE_GEMINI_API_KEY=fashionos-gemini-key:latest
+    waitFor: [push]
+
+  # ── 4. Deploy Celery worker + beat (always-on, single instance) ─────────────
+  # max-instances=1 is REQUIRED — multiple instances = duplicate beat tasks.
+  # no-cpu-throttling keeps worker responsive between task executions.
+  - id: deploy-worker
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud run deploy fashionos-worker \
+          --image=${_IMAGE}:${COMMIT_SHA} \
+          --region=${_REGION} \
+          --platform=managed \
+          --port=8080 \
+          --no-allow-unauthenticated \
+          --min-instances=1 \
+          --max-instances=1 \
+          --memory=2Gi \
+          --cpu=1 \
+          --no-cpu-throttling \
+          --timeout=900 \
+          --args=worker-beat \
+          --set-env-vars=GOOGLE_CLOUD_PROJECT=$$PROJECT_ID,ENV=production \
+          --update-secrets=DATABASE_URL=fashionos-database-url:latest,REDIS_URL=fashionos-redis-url:latest,BRAND_ID=fashionos-brand-id:latest,BRAND_NAME=fashionos-brand-name:latest,SHOPIFY_SHOP_NAME=fashionos-shopify-shop:latest,SHOPIFY_ACCESS_TOKEN=fashionos-shopify-token:latest,SHOPIFY_WEBHOOK_SECRET=fashionos-webhook-secret:latest,APIFY_API_TOKEN=fashionos-apify-token:latest,META_ACCESS_TOKEN=fashionos-meta-token:latest,META_AD_ACCOUNT_ID=fashionos-meta-account:latest,INSTAGRAM_ACCESS_TOKEN=fashionos-instagram-token:latest,INSTAGRAM_PAGE_ID=fashionos-instagram-page:latest,NOTIFY_MCP_URL=fashionos-notify-mcp-url:latest
+    waitFor: [push]
+
+images:
+  - ${_IMAGE}:${COMMIT_SHA}
+  - ${_IMAGE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
