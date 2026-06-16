@@ -17,8 +17,14 @@ from db.session import get_session
 
 ADMIN_SECRET  = os.getenv("FASHIONOS_ADMIN_SECRET", "")
 CLERK_SECRET  = os.getenv("CLERK_SECRET_KEY", "")
-FRONTEND_URL  = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
+
+FRONTEND_URL       = os.getenv("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL_PROD  = os.getenv("FRONTEND_URL_PROD", "")
+
+authorized = [FRONTEND_URL]
+if FRONTEND_URL_PROD:
+    authorized.append(FRONTEND_URL_PROD)
 _clerk: Optional[Clerk] = None
 
 
@@ -42,7 +48,7 @@ async def get_current_brand(
     try:
         state = _get_clerk().authenticate_request(
             request,
-            AuthenticateRequestOptions(authorized_parties=[FRONTEND_URL]),
+            AuthenticateRequestOptions(authorized_parties=authorized),
         )
     except Exception as exc:
         raise HTTPException(status_code=401, detail=f"Auth error: {exc}")
