@@ -35,6 +35,9 @@ from db import crud
 from db.schemas import MarketingActionSchema, PricingActionSchema, RestockRecommendationSchema
 from db.session import get_session
 
+from api.auth import get_current_brand
+from db.models import Brand
+
 router = APIRouter(prefix="/api/v1", tags=["approvals"])
 
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")

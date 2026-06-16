@@ -26,6 +26,8 @@ pandas
 
 cryptography 
 
+clerk-backend-api
+svix
 
 # huggingface and related libraries
 

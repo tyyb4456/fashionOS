@@ -1,87 +1,71 @@
 """
-FashionOS API Key Authentication
-==================================
-API key format:  fos_{brand_prefix}_{48_hex_chars}
-  e.g.           fos_coolbrand_a1b2c3d4e5f6...
-
-Key is returned ONCE at creation. Only the SHA-256 hash is stored.
-The 16-char prefix is stored plaintext for fast lookup.
-
-Usage in routes:
-    brand: Brand = Depends(get_current_brand)
+FashionOS Authentication — Clerk JWT only.
+API keys removed. All routes use get_current_brand (Clerk JWT).
+Admin routes use require_admin (X-Admin-Secret header).
 """
 
-import hashlib
 import os
-import secrets
-from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import Depends, Header, HTTPException, status
+from clerk_backend_api import Clerk, AuthenticateRequestOptions
+from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import ApiKey, Brand
+from db.models import Brand
 from db.session import get_session
 
-ADMIN_SECRET = os.getenv("FASHIONOS_ADMIN_SECRET", "")
+ADMIN_SECRET  = os.getenv("FASHIONOS_ADMIN_SECRET", "")
+CLERK_SECRET  = os.getenv("CLERK_SECRET_KEY", "")
+FRONTEND_URL  = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+_clerk: Optional[Clerk] = None
 
 
-def generate_api_key(brand_id: str) -> tuple[str, str, str]:
-    """
-    Returns (full_key, prefix, sha256_hash).
-    full_key  → shown to user once, never stored
-    prefix    → stored plaintext for lookup narrowing
-    key_hash  → stored in DB for verification
-    """
-    slug     = brand_id[:8].lower().replace("-", "").replace("_", "")
-    prefix   = f"fos_{slug}"
-    secret   = secrets.token_hex(24)          # 48 hex chars
-    full_key = f"{prefix}_{secret}"
-    key_hash = hashlib.sha256(full_key.encode()).hexdigest()
-    return full_key, prefix, key_hash
+def _get_clerk() -> Clerk:
+    global _clerk
+    if _clerk is None:
+        if not CLERK_SECRET:
+            raise RuntimeError("CLERK_SECRET_KEY not set.")
+        _clerk = Clerk(bearer_auth=CLERK_SECRET)
+    return _clerk
 
 
 async def get_current_brand(
-    x_api_key: str = Header(..., alias="X-API-Key"),
-    session:   AsyncSession = Depends(get_session),
+    request: Request,
+    session: AsyncSession = Depends(get_session),
 ) -> Brand:
     """
-    FastAPI dependency: validates API key → returns associated Brand.
-    Raises 401 on invalid key, 403 on inactive brand.
+    Validates Clerk JWT → returns Brand.
+    Frontend sends: Authorization: Bearer <clerk_token>
     """
-    if not x_api_key or not x_api_key.startswith("fos_"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key format. Expected: fos_{brand}_{secret}",
+    try:
+        state = _get_clerk().authenticate_request(
+            request,
+            AuthenticateRequestOptions(authorized_parties=[FRONTEND_URL]),
         )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Auth error: {exc}")
 
-    key_hash = hashlib.sha256(x_api_key.encode()).hexdigest()
+    if not state.is_signed_in:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
 
-    key_rec = (await session.execute(
-        select(ApiKey).where(
-            ApiKey.key_hash  == key_hash,
-            ApiKey.is_active == True,  # noqa: E712
-        )
-    )).scalar_one_or_none()
-
-    if not key_rec:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or revoked API key.",
-        )
+    clerk_user_id = state.payload.get("sub")
+    if not clerk_user_id:
+        raise HTTPException(status_code=401, detail="Invalid token.")
 
     brand = (await session.execute(
-        select(Brand).where(Brand.brand_id == key_rec.brand_id)
+        select(Brand).where(Brand.clerk_user_id == clerk_user_id)
     )).scalar_one_or_none()
 
-    if not brand or not brand.is_active:
+    if not brand:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Brand account is inactive or suspended.",
+            status_code=404,
+            detail="No brand found. Complete onboarding first.",
         )
 
-    # Lazy update — non-blocking
-    key_rec.last_used_at = datetime.now(timezone.utc)
+    if not brand.is_active:
+        raise HTTPException(status_code=403, detail="Brand account is inactive.")
 
     return brand
 
@@ -89,8 +73,7 @@ async def get_current_brand(
 def require_admin(
     x_admin_secret: str = Header("", alias="X-Admin-Secret"),
 ) -> None:
-    """Gate for brand-provisioning endpoints. Requires FASHIONOS_ADMIN_SECRET header."""
     if not ADMIN_SECRET:
-        raise HTTPException(500, "FASHIONOS_ADMIN_SECRET not configured on server.")
+        raise HTTPException(500, "FASHIONOS_ADMIN_SECRET not configured.")
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(403, "Invalid admin secret.")

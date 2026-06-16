@@ -144,37 +144,37 @@ services:
       retries: 5
       start_period: 15s
 
-  fashionos-api:
-      build: { context: ., dockerfile: Dockerfile }
-      container_name: fashionos_api
-      command: ["api"]
-      env_file: .env
-      environment:
-        REDIS_URL: redis://redis:6379/0
-        DATABASE_URL: postgresql+asyncpg://fashionos:fashionos_dev@postgres:5432/fashionos
-      ports:
-        - "8080:8080"
-      depends_on:
-        redis:    { condition: service_healthy }
-        postgres: { condition: service_healthy }
+  # fashionos-api:
+  #     build: { context: ., dockerfile: Dockerfile }
+  #     container_name: fashionos_api
+  #     command: ["api"]
+  #     env_file: .env
+  #     environment:
+  #       REDIS_URL: redis://redis:6379/0
+  #       DATABASE_URL: postgresql+asyncpg://fashionos:fashionos_dev@postgres:5432/fashionos
+  #     ports:
+  #       - "8080:8080"
+  #     depends_on:
+  #       redis:    { condition: service_healthy }
+  #       postgres: { condition: service_healthy }
 
-  fashionos-worker:
-      build: { context: ., dockerfile: Dockerfile }
-      container_name: fashionos_worker
-      command: ["worker-beat"]
-      env_file: .env
-      environment:
-        REDIS_URL: redis://redis:6379/0        # ← service name, not localhost
-        DATABASE_URL: postgresql+asyncpg://fashionos:fashionos_dev@postgres:5432/fashionos
-        SHOPIFY_MCP_URL: http://shopify-mcp:8001/mcp
-        SOCIAL_MCP_URL:  http://social-mcp:8002/mcp
-        TRENDS_MCP_URL:  http://trends-mcp:8003/mcp
-        ADS_MCP_URL:     http://ads-mcp:8004/mcp
-        NOTIFY_MCP_URL:  http://notify-mcp:8005/mcp
-      depends_on:
-        redis:       { condition: service_healthy }
-        postgres:    { condition: service_healthy }
-      restart: unless-stopped
+  # fashionos-worker:
+  #     build: { context: ., dockerfile: Dockerfile }
+  #     container_name: fashionos_worker
+  #     command: ["worker-beat"]
+  #     env_file: .env
+  #     environment:
+  #       REDIS_URL: redis://redis:6379/0        # ← service name, not localhost
+  #       DATABASE_URL: postgresql+asyncpg://fashionos:fashionos_dev@postgres:5432/fashionos
+  #       SHOPIFY_MCP_URL: http://shopify-mcp:8001/mcp
+  #       SOCIAL_MCP_URL:  http://social-mcp:8002/mcp
+  #       TRENDS_MCP_URL:  http://trends-mcp:8003/mcp
+  #       ADS_MCP_URL:     http://ads-mcp:8004/mcp
+  #       NOTIFY_MCP_URL:  http://notify-mcp:8005/mcp
+  #     depends_on:
+  #       redis:       { condition: service_healthy }
+  #       postgres:    { condition: service_healthy }
+  #     restart: unless-stopped
 
 
   fashionos-migrate:

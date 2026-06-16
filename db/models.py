@@ -322,6 +322,9 @@ class Brand(Base):
     brand_id:   Mapped[str]       = mapped_column(String(100), unique=True, nullable=False, index=True)
     brand_name: Mapped[str]       = mapped_column(String(255), nullable=False)
     owner_email:Mapped[str]       = mapped_column(String(255), unique=True, nullable=False, index=True)
+    clerk_user_id: Mapped[Optional[str]] = mapped_column(
+        String(255), unique=True, nullable=True, index=True
+    )
     plan:       Mapped[str]       = mapped_column(String(50),  nullable=False, default="starter")
     is_active:  Mapped[bool]      = mapped_column(Boolean,     nullable=False, default=True)
 
