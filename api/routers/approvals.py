@@ -13,10 +13,18 @@ Routes:
   PATCH /api/v1/restock/{record_id}/reject     ← mark rejected
   PATCH /api/v1/content/{record_id}/status     ← mark posted / skipped
 
+Session 8 — multi-tenancy hardening:
+  Every route now requires `brand: Brand = Depends(get_current_brand)`.
+  After fetching a record by id, we verify `rec.brand_id == brand.brand_id`
+  before doing anything else — 404 if missing, 403 if it belongs to another
+  brand. brand_id is then threaded into the crud mark_*/update_* calls as a
+  second ownership guard in the WHERE clause (defense in depth — even a bug
+  in the route check can't let one brand mutate another brand's records).
+
 Design:
   - All approval endpoints make live MCP API calls inline (FastAPI async, no Celery).
   - MCP errors return 502 with details — DB record stays unchanged so retry is safe.
-  - DB updates use new crud update helpers added in session 8.
+  - DB updates use crud update helpers (brand-scoped).
   - Rejection endpoints just update the DB — no external API call needed.
   - Restock approval optionally sends WhatsApp via notify-mcp if NOTIFY_MCP_URL is set.
 """
@@ -84,11 +92,14 @@ class ContentStatusBody(BaseModel):
 )
 async def approve_pricing_decision(
     record_id: UUID,
+    brand:     Brand = Depends(get_current_brand),
     session:   AsyncSession = Depends(get_session),
 ) -> PricingActionSchema:
     rec = await crud.get_pricing_action(session, record_id=str(record_id))
     if not rec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pricing record not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
     if rec.auto_executed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already executed.")
     if rec.action == "hold":
@@ -109,6 +120,7 @@ async def approve_pricing_decision(
             "new_price":        rec.recommended_price,
             "compare_at_price": rec.current_price if rec.action == "markdown" else None,
             "reason":           f"[APPROVED] {rec.reason or rec.action}",
+            "brand_id":         brand.brand_id,
         })
         result = _parse_mcp_result(raw)
         if isinstance(result, dict) and not result.get("success", True) is False:
@@ -122,7 +134,7 @@ async def approve_pricing_decision(
         )
 
     # ── Update DB ──────────────────────────────────────────────────────────────
-    updated = await crud.mark_pricing_executed(session, record_id=str(record_id))
+    updated = await crud.mark_pricing_executed(session, record_id=str(record_id), brand_id=brand.brand_id)
     return PricingActionSchema.model_validate(updated)
 
 
@@ -134,15 +146,18 @@ async def approve_pricing_decision(
 )
 async def reject_pricing_decision(
     record_id: UUID,
+    brand:     Brand = Depends(get_current_brand),
     session:   AsyncSession = Depends(get_session),
 ) -> PricingActionSchema:
     rec = await crud.get_pricing_action(session, record_id=str(record_id))
     if not rec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pricing record not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
     if rec.auto_executed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already executed — cannot reject.")
 
-    updated = await crud.mark_pricing_rejected(session, record_id=str(record_id))
+    updated = await crud.mark_pricing_rejected(session, record_id=str(record_id), brand_id=brand.brand_id)
     return PricingActionSchema.model_validate(updated)
 
 
@@ -162,11 +177,14 @@ async def reject_pricing_decision(
 )
 async def approve_marketing_decision(
     record_id: UUID,
+    brand:     Brand = Depends(get_current_brand),
     session:   AsyncSession = Depends(get_session),
 ) -> MarketingActionSchema:
     rec = await crud.get_marketing_action(session, record_id=str(record_id))
     if not rec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Marketing record not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
     if rec.auto_executed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already executed.")
     if rec.action not in ("increase_budget", "activate"):
@@ -188,6 +206,7 @@ async def approve_marketing_decision(
                 "campaign_id":          rec.campaign_id,
                 "new_daily_budget_pkr": rec.new_budget_pkr,
                 "reason":               f"[APPROVED] {rec.reason or 'Budget increase approved by founder.'}",
+                "brand_id":             brand.brand_id,
             })
 
         elif rec.action == "activate":
@@ -196,6 +215,7 @@ async def approve_marketing_decision(
             raw = await tool_map["activate_campaign"].ainvoke({
                 "campaign_id": rec.campaign_id,
                 "reason":      f"[APPROVED] {rec.reason or 'Campaign activation approved by founder.'}",
+                "brand_id":    brand.brand_id,
             })
 
         result = _parse_mcp_result(raw)
@@ -207,7 +227,7 @@ async def approve_marketing_decision(
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"ads-mcp call failed: {exc}")
 
-    updated = await crud.mark_marketing_executed(session, record_id=str(record_id))
+    updated = await crud.mark_marketing_executed(session, record_id=str(record_id), brand_id=brand.brand_id)
     return MarketingActionSchema.model_validate(updated)
 
 
@@ -218,15 +238,18 @@ async def approve_marketing_decision(
 )
 async def reject_marketing_decision(
     record_id: UUID,
+    brand:     Brand = Depends(get_current_brand),
     session:   AsyncSession = Depends(get_session),
 ) -> MarketingActionSchema:
     rec = await crud.get_marketing_action(session, record_id=str(record_id))
     if not rec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Marketing record not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
     if rec.auto_executed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already executed.")
 
-    updated = await crud.mark_marketing_rejected(session, record_id=str(record_id))
+    updated = await crud.mark_marketing_rejected(session, record_id=str(record_id), brand_id=brand.brand_id)
     return MarketingActionSchema.model_validate(updated)
 
 
@@ -247,11 +270,14 @@ async def reject_marketing_decision(
 async def approve_restock_order(
     record_id: UUID,
     body:      RestockApproveBody = RestockApproveBody(),
+    brand:     Brand = Depends(get_current_brand),
     session:   AsyncSession       = Depends(get_session),
 ) -> RestockRecommendationSchema:
     rec = await crud.get_restock_recommendation(session, record_id=str(record_id))
     if not rec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Restock record not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
     if rec.status not in ("pending_approval",):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Already in status '{rec.status}'.")
 
@@ -265,6 +291,7 @@ async def approve_restock_order(
 
             if "send_restock_whatsapp" in tool_map:
                 raw = await tool_map["send_restock_whatsapp"].ainvoke({
+                    "brand_id":         brand.brand_id,
                     "supplier_number":  body.supplier_whatsapp,
                     "sku":              rec.sku,
                     "product_title":    "",  # not stored on record
@@ -280,7 +307,9 @@ async def approve_restock_order(
 
     # ── Update DB ──────────────────────────────────────────────────────────────
     new_status = "ordered" if whatsapp_sent else "approved"
-    updated    = await crud.update_restock_status(session, record_id=str(record_id), new_status=new_status)
+    updated    = await crud.update_restock_status(
+        session, record_id=str(record_id), new_status=new_status, brand_id=brand.brand_id
+    )
     return RestockRecommendationSchema.model_validate(updated)
 
 
@@ -291,15 +320,20 @@ async def approve_restock_order(
 )
 async def reject_restock_order(
     record_id: UUID,
+    brand:     Brand = Depends(get_current_brand),
     session:   AsyncSession = Depends(get_session),
 ) -> RestockRecommendationSchema:
     rec = await crud.get_restock_recommendation(session, record_id=str(record_id))
     if not rec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Restock record not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
     if rec.status not in ("pending_approval",):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Already in status '{rec.status}'.")
 
-    updated = await crud.update_restock_status(session, record_id=str(record_id), new_status="cancelled")
+    updated = await crud.update_restock_status(
+        session, record_id=str(record_id), new_status="cancelled", brand_id=brand.brand_id
+    )
     return RestockRecommendationSchema.model_validate(updated)
 
 
@@ -315,6 +349,7 @@ async def reject_restock_order(
 async def update_content_status(
     record_id: UUID,
     body:      ContentStatusBody,
+    brand:     Brand = Depends(get_current_brand),
     session:   AsyncSession = Depends(get_session),
 ):
     if body.new_status not in ("posted", "skipped"):
@@ -323,6 +358,10 @@ async def update_content_status(
     rec = await crud.get_content_post(session, record_id=str(record_id))
     if not rec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content post not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
 
-    updated = await crud.update_content_post_status(session, record_id=str(record_id), new_status=body.new_status)
+    updated = await crud.update_content_post_status(
+        session, record_id=str(record_id), new_status=body.new_status, brand_id=brand.brand_id
+    )
     return {"id": str(record_id), "status": body.new_status, "sku": rec.sku}

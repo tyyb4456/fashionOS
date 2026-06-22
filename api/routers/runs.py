@@ -61,10 +61,10 @@ router = APIRouter(prefix="/api/v1", tags=["runs"])
     summary="List agent run history",
 )
 async def list_runs(
-    brand: Brand = Depends(get_current_brand),
-    limit:    int          = Query(50, ge=1, le=200),
-    offset:   int          = Query(0,  ge=0),
-    session:  AsyncSession = Depends(get_session),
+    brand:   Brand = Depends(get_current_brand),
+    limit:   int          = Query(50, ge=1, le=200),
+    offset:  int          = Query(0,  ge=0),
+    session: AsyncSession = Depends(get_session),
 ) -> list[RunSummarySchema]:
     runs = await crud.list_runs(session, brand_id=brand.brand_id, limit=limit, offset=offset)
     return [RunSummarySchema.model_validate(r) for r in runs]
@@ -78,11 +78,14 @@ async def list_runs(
 )
 async def get_run(
     run_id:  str,
+    brand:   Brand = Depends(get_current_brand),
     session: AsyncSession = Depends(get_session),
 ) -> RunDetailSchema:
     run = await crud.get_run(session, run_id=run_id)
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+    if run.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
 
     # Fetch all child records
     snapshots       = await crud.get_run_snapshots(session, run_id=run_id)
@@ -110,11 +113,14 @@ async def get_run(
 )
 async def get_run_inventory(
     run_id:  str,
+    brand:   Brand = Depends(get_current_brand),
     session: AsyncSession = Depends(get_session),
 ) -> list[InventorySnapshotSchema]:
     run = await crud.get_run(session, run_id=run_id)
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+    if run.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
     snapshots = await crud.get_run_snapshots(session, run_id=run_id)
     return [InventorySnapshotSchema.model_validate(s) for s in snapshots]
 
@@ -127,11 +133,14 @@ async def get_run_inventory(
 )
 async def get_run_marketing_decisions(
     run_id:  str,
+    brand:   Brand = Depends(get_current_brand),
     session: AsyncSession = Depends(get_session),
 ) -> list[MarketingActionSchema]:
     run = await crud.get_run(session, run_id=run_id)
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+    if run.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
     records = await crud.get_run_marketing(session, run_id=run_id)
     return [MarketingActionSchema.model_validate(r) for r in records]
 
@@ -144,11 +153,14 @@ async def get_run_marketing_decisions(
 )
 async def get_run_content_posts(
     run_id:  str,
+    brand:   Brand = Depends(get_current_brand),
     session: AsyncSession = Depends(get_session),
 ) -> list[ContentPostSchema]:
     run = await crud.get_run(session, run_id=run_id)
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+    if run.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
     records = await crud.get_run_content(session, run_id=run_id)
     return [ContentPostSchema.model_validate(r) for r in records]
 
@@ -161,11 +173,14 @@ async def get_run_content_posts(
 )
 async def get_run_return_insights(
     run_id:  str,
+    brand:   Brand = Depends(get_current_brand),
     session: AsyncSession = Depends(get_session),
 ) -> list[ReturnInsightSchema]:
     run = await crud.get_run(session, run_id=run_id)
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+    if run.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
     records = await crud.get_run_return_insights(session, run_id=run_id)
     return [ReturnInsightSchema.model_validate(r) for r in records]
 
@@ -180,9 +195,9 @@ async def get_run_return_insights(
     summary="Get recent critical alerts",
 )
 async def get_critical_alerts(
-    brand: Brand = Depends(get_current_brand),
-    limit:    int          = Query(20, ge=1, le=100),
-    session:  AsyncSession = Depends(get_session),
+    brand:   Brand = Depends(get_current_brand),
+    limit:   int          = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
 ) -> list[AlertSchema]:
     alerts = await crud.get_critical_alerts(session, brand_id=brand.brand_id, limit=limit)
     return [AlertSchema.model_validate(a) for a in alerts]
@@ -199,9 +214,9 @@ async def get_critical_alerts(
     description="Markdowns >15%, price increases, clearance codes — all awaiting human approval.",
 )
 async def get_pending_pricing(
-    brand: Brand = Depends(get_current_brand),
-    limit:    int          = Query(100, ge=1, le=500),
-    session:  AsyncSession = Depends(get_session),
+    brand:   Brand = Depends(get_current_brand),
+    limit:   int          = Query(100, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
 ) -> list[PricingActionSchema]:
     records = await crud.get_pending_pricing(session, brand_id=brand.brand_id, limit=limit)
     return [PricingActionSchema.model_validate(r) for r in records]
@@ -214,8 +229,8 @@ async def get_pending_pricing(
     description="Restock recommendations sorted by urgency (lowest days of stock first).",
 )
 async def get_pending_restocks(
-    brand: Brand = Depends(get_current_brand),
-    session:  AsyncSession = Depends(get_session),
+    brand:   Brand = Depends(get_current_brand),
+    session: AsyncSession = Depends(get_session),
 ) -> list[RestockRecommendationSchema]:
     records = await crud.get_pending_restocks(session, brand_id=brand.brand_id)
     return [RestockRecommendationSchema.model_validate(r) for r in records]
@@ -231,9 +246,9 @@ async def get_pending_restocks(
     ),
 )
 async def get_pending_marketing_decisions(
-    brand: Brand = Depends(get_current_brand),
-    limit:    int          = Query(100, ge=1, le=500),
-    session:  AsyncSession = Depends(get_session),
+    brand:   Brand = Depends(get_current_brand),
+    limit:   int          = Query(100, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
 ) -> list[MarketingActionSchema]:
     records = await crud.get_pending_marketing(session, brand_id=brand.brand_id, limit=limit)
     return [MarketingActionSchema.model_validate(r) for r in records]
@@ -249,10 +264,10 @@ async def get_pending_marketing_decisions(
     ),
 )
 async def get_content_queue(
-    brand: Brand = Depends(get_current_brand),
-    status:   str          = Query("pending", description="pending | posted | skipped"),
-    limit:    int          = Query(50, ge=1, le=200),
-    session:  AsyncSession = Depends(get_session),
+    brand:   Brand = Depends(get_current_brand),
+    status:  str          = Query("pending", description="pending | posted | skipped"),
+    limit:   int          = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
 ) -> list[ContentPostSchema]:
     records = await crud.get_content_queue(session, brand_id=brand.brand_id, status=status, limit=limit)
     return [ContentPostSchema.model_validate(r) for r in records]
@@ -269,7 +284,7 @@ async def get_content_queue(
     ),
 )
 async def get_return_insights(
-    brand: Brand = Depends(get_current_brand),
+    brand:    Brand = Depends(get_current_brand),
     severity: Optional[str]      = Query(None, description="Filter: critical | warning | info"),
     limit:    int                 = Query(50, ge=1, le=200),
     session:  AsyncSession        = Depends(get_session),
@@ -288,10 +303,10 @@ async def get_return_insights(
     summary="Get inventory history for a SKU",
 )
 async def get_sku_history(
-    sku:      str,
-    brand:    Brand = Depends(get_current_brand),
-    limit:    int          = Query(30, ge=1, le=100),
-    session:  AsyncSession = Depends(get_session),
+    sku:     str,
+    brand:   Brand = Depends(get_current_brand),
+    limit:   int          = Query(30, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
 ) -> list[InventorySnapshotSchema]:
     records = await crud.get_sku_history(session, brand_id=brand.brand_id, sku=sku, limit=limit)
     if not records:
@@ -317,7 +332,7 @@ async def get_sku_history(
     ),
 )
 async def get_dashboard(
-    brand:    Brand = Depends(get_current_brand),
+    brand:        Brand = Depends(get_current_brand),
     recent_limit: int          = Query(10, ge=1, le=50),
     session:      AsyncSession = Depends(get_session),
 ) -> DashboardSummarySchema:

@@ -8,6 +8,10 @@ Session 6 additions:
   get_pending_marketing()  → marketing approval queue
   get_content_queue()      → pending content posts (newest first)
   get_return_insights()    → returns fix queue (most severe first)
+
+Session 8 additions (multi-tenancy hardening):
+  All approval/update helpers now accept brand_id and include it in the WHERE
+  clause as a second ownership guard — defense in depth against cross-tenant writes.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from db.models import (
     ReturnInsightRecord,
 )
 
-from sqlalchemy import update as sa_update 
+from sqlalchemy import update as sa_update
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +56,7 @@ async def save_run(
 
     Child records saved:
       inventory_snapshots, pricing_actions, alerts, restock_recommendations,
-      marketing_actions (NEW), content_posts (NEW), return_insights (NEW)
+      marketing_actions, content_posts, return_insights
     """
     run_id = summary["run_id"]
 
@@ -91,7 +95,6 @@ async def save_run(
         pricing_auto_executed    = pricing_stats.get("auto_executed", 0),
         pricing_pending_approval = pricing_stats.get("pending_approval", 0),
 
-        # Marketing cached counts (NEW session 6)
         marketing_decisions_total  = marketing_stats.get("total_decisions", 0),
         marketing_auto_executed    = marketing_stats.get("auto_executed", 0),
         marketing_pending_approval = marketing_stats.get("pending_approval", 0),
@@ -159,7 +162,7 @@ async def save_run(
             status                  = rec.get("status", "pending_approval"),
         ))
 
-    # ── 6. Marketing actions (NEW session 6) ──────────────────────────────────
+    # ── 6. Marketing actions ──────────────────────────────────────────────────
     for act in state.get("marketing_actions", []):
         session.add(MarketingActionRecord(
             run_id             = run_id,
@@ -168,15 +171,15 @@ async def save_run(
             campaign_id        = act.get("campaign_id", ""),
             campaign_name      = act.get("campaign_name", ""),
             action             = act.get("action", "hold"),
-            current_budget_pkr = abs(act.get("amount_delta", 0.0) or 0.0),  # fallback
-            new_budget_pkr     = None,   # amount_delta is relative; absolute set separately
-            change_pct         = 0.0,    # derived from amount_delta if needed
+            current_budget_pkr = abs(act.get("amount_delta", 0.0) or 0.0),
+            new_budget_pkr     = None,
+            change_pct         = 0.0,
             auto_executed      = act.get("auto_executed", False),
             reason             = act.get("reason"),
             trigger            = act.get("trigger"),
         ))
 
-    # ── 7. Content posts (NEW session 6) ──────────────────────────────────────
+    # ── 7. Content posts ──────────────────────────────────────────────────────
     for post in state.get("content_queue", []):
         ig   = post.get("instagram", {})
         tt   = post.get("tiktok", {})
@@ -197,7 +200,7 @@ async def save_run(
             sale_mention       = post.get("sale_mention"),
         ))
 
-    # ── 8. Return insights (NEW session 6) ────────────────────────────────────
+    # ── 8. Return insights ────────────────────────────────────────────────────
     for insight in state.get("return_insights", []):
         session.add(ReturnInsightRecord(
             run_id               = run_id,
@@ -352,19 +355,11 @@ async def get_sku_history(
     return list(result.scalars().all())
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# READS — New helpers (session 6)
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def get_pending_marketing(
     session: AsyncSession,
     brand_id: str,
     limit: int = 100,
 ) -> list[MarketingActionRecord]:
-    """
-    Marketing decisions awaiting human approval (increase_budget, activate).
-    Sorted by most recent run first — so the dashboard always shows latest decisions.
-    """
     result = await session.execute(
         select(MarketingActionRecord)
         .where(
@@ -384,10 +379,6 @@ async def get_content_queue(
     status: str = "pending",
     limit: int = 50,
 ) -> list[ContentPostRecord]:
-    """
-    Content posts with the given status (default: pending).
-    Urgent posts first, then by creation time.
-    """
     result = await session.execute(
         select(ContentPostRecord)
         .where(
@@ -409,10 +400,6 @@ async def get_return_insights(
     severity: Optional[str] = None,
     limit: int = 50,
 ) -> list[ReturnInsightRecord]:
-    """
-    Returns fix queue. Critical first, then warning, then info.
-    Optionally filter by severity.
-    """
     severity_order = {"critical": 0, "warning": 1, "info": 2}
 
     query = (
@@ -422,15 +409,10 @@ async def get_return_insights(
     if severity:
         query = query.where(ReturnInsightRecord.severity == severity)
 
-    # Sort by severity (critical first) then created_at desc
-    query = query.order_by(
-        desc(ReturnInsightRecord.created_at)
-    ).limit(limit)
+    query = query.order_by(desc(ReturnInsightRecord.created_at)).limit(limit)
 
     result = await session.execute(query)
     rows   = list(result.scalars().all())
-
-    # Python-side sort by severity priority (SQL CASE would also work)
     rows.sort(key=lambda r: (severity_order.get(r.severity, 9), r.created_at), reverse=False)
     return rows
 
@@ -438,7 +420,6 @@ async def get_return_insights(
 async def get_run_marketing(
     session: AsyncSession, run_id: str
 ) -> list[MarketingActionRecord]:
-    """All marketing actions for a specific run."""
     result = await session.execute(
         select(MarketingActionRecord)
         .where(MarketingActionRecord.run_id == run_id)
@@ -450,7 +431,6 @@ async def get_run_marketing(
 async def get_run_content(
     session: AsyncSession, run_id: str
 ) -> list[ContentPostRecord]:
-    """All content posts for a specific run. Urgent first."""
     result = await session.execute(
         select(ContentPostRecord)
         .where(ContentPostRecord.run_id == run_id)
@@ -462,7 +442,6 @@ async def get_run_content(
 async def get_run_return_insights(
     session: AsyncSession, run_id: str
 ) -> list[ReturnInsightRecord]:
-    """All return insights for a specific run."""
     result = await session.execute(
         select(ReturnInsightRecord)
         .where(ReturnInsightRecord.run_id == run_id)
@@ -482,11 +461,15 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
         return dt
     except (ValueError, TypeError):
         return None
-    
-# ----------------
-# session 7 updation 
-# ---------------
-    
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# APPROVAL / UPDATE HELPERS
+# brand_id included in WHERE clause — defense in depth against cross-tenant writes.
+# The router already verifies ownership before calling these, but a stale or
+# buggy caller can never mutate another tenant's records even if it bypasses
+# the router check.
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def get_pricing_action(
     session: AsyncSession,
@@ -531,11 +514,12 @@ async def get_content_post(
 async def mark_pricing_executed(
     session: AsyncSession,
     record_id: str,
+    brand_id: str,
 ) -> Optional[PricingActionRecord]:
-    """Set auto_executed=True on a pricing action record."""
+    """Set auto_executed=True. brand_id in WHERE prevents cross-tenant mutation."""
     await session.execute(
         sa_update(PricingActionRecord)
-        .where(PricingActionRecord.id == record_id)
+        .where(PricingActionRecord.id == record_id, PricingActionRecord.brand_id == brand_id)
         .values(auto_executed=True)
     )
     await session.flush()
@@ -545,11 +529,12 @@ async def mark_pricing_executed(
 async def mark_pricing_rejected(
     session: AsyncSession,
     record_id: str,
+    brand_id: str,
 ) -> Optional[PricingActionRecord]:
-    """Set action='rejected' so the dashboard can filter it out."""
+    """Set action='rejected'. brand_id in WHERE prevents cross-tenant mutation."""
     await session.execute(
         sa_update(PricingActionRecord)
-        .where(PricingActionRecord.id == record_id)
+        .where(PricingActionRecord.id == record_id, PricingActionRecord.brand_id == brand_id)
         .values(action="rejected")
     )
     await session.flush()
@@ -559,11 +544,12 @@ async def mark_pricing_rejected(
 async def mark_marketing_executed(
     session: AsyncSession,
     record_id: str,
+    brand_id: str,
 ) -> Optional[MarketingActionRecord]:
-    """Set auto_executed=True on a marketing action record."""
+    """Set auto_executed=True. brand_id in WHERE prevents cross-tenant mutation."""
     await session.execute(
         sa_update(MarketingActionRecord)
-        .where(MarketingActionRecord.id == record_id)
+        .where(MarketingActionRecord.id == record_id, MarketingActionRecord.brand_id == brand_id)
         .values(auto_executed=True)
     )
     await session.flush()
@@ -573,11 +559,12 @@ async def mark_marketing_executed(
 async def mark_marketing_rejected(
     session: AsyncSession,
     record_id: str,
+    brand_id: str,
 ) -> Optional[MarketingActionRecord]:
-    """Set action='rejected' on a marketing action record."""
+    """Set action='rejected'. brand_id in WHERE prevents cross-tenant mutation."""
     await session.execute(
         sa_update(MarketingActionRecord)
-        .where(MarketingActionRecord.id == record_id)
+        .where(MarketingActionRecord.id == record_id, MarketingActionRecord.brand_id == brand_id)
         .values(action="rejected")
     )
     await session.flush()
@@ -588,11 +575,12 @@ async def update_restock_status(
     session: AsyncSession,
     record_id: str,
     new_status: str,   # "approved" | "ordered" | "cancelled"
+    brand_id: str,
 ) -> Optional[RestockRecommendationRecord]:
-    """Update restock recommendation status."""
+    """Update restock status. brand_id in WHERE prevents cross-tenant mutation."""
     await session.execute(
         sa_update(RestockRecommendationRecord)
-        .where(RestockRecommendationRecord.id == record_id)
+        .where(RestockRecommendationRecord.id == record_id, RestockRecommendationRecord.brand_id == brand_id)
         .values(status=new_status)
     )
     await session.flush()
@@ -603,11 +591,12 @@ async def update_content_post_status(
     session: AsyncSession,
     record_id: str,
     new_status: str,   # "posted" | "skipped"
+    brand_id: str,
 ) -> Optional[ContentPostRecord]:
-    """Update content post status."""
+    """Update content post status. brand_id in WHERE prevents cross-tenant mutation."""
     await session.execute(
         sa_update(ContentPostRecord)
-        .where(ContentPostRecord.id == record_id)
+        .where(ContentPostRecord.id == record_id, ContentPostRecord.brand_id == brand_id)
         .values(status=new_status)
     )
     await session.flush()

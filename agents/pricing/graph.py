@@ -324,7 +324,7 @@ def load_domain_skill(state: PricingAgentState) -> dict:
 # NODE 3 — run_claude_analysis
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def run_claude_analysis(state: PricingAgentState) -> dict:
+async def run_chat_model_analysis(state: PricingAgentState) -> dict:
     """
     Single structured LLM call that produces the full pricing decision set.
 
@@ -632,13 +632,13 @@ def build_pricing_graph() -> StateGraph:
 
     graph.add_node("fetch_pricing_data",     fetch_pricing_data)
     graph.add_node("load_domain_skill",      load_domain_skill)
-    graph.add_node("run_claude_analysis",    run_claude_analysis)
+    graph.add_node("run_chat_model_analysis",    run_chat_model_analysis)
     graph.add_node("execute_pricing_actions",execute_pricing_actions)
 
     graph.add_edge(START,                     "fetch_pricing_data")
     graph.add_edge("fetch_pricing_data",      "load_domain_skill")
-    graph.add_edge("load_domain_skill",       "run_claude_analysis")
-    graph.add_edge("run_claude_analysis",     "execute_pricing_actions")
+    graph.add_edge("load_domain_skill",       "run_chat_model_analysis")
+    graph.add_edge("run_chat_model_analysis",     "execute_pricing_actions")
     graph.add_edge("execute_pricing_actions", END)
 
     return graph.compile()

@@ -29,6 +29,8 @@ cryptography
 clerk-backend-api
 svix
 
+langchain-groq 
+
 # huggingface and related libraries
 
 # langchain-huggingface 

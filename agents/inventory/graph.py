@@ -61,6 +61,8 @@ from agents.state import AgentAlert, InventorySnapshot
 from dotenv import load_dotenv
 load_dotenv()
 
+from response_schemas.inventory_model import InventoryAnalysis, SnapshotOut, AlertOut
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -82,59 +84,6 @@ SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
 
 
 model = init_chat_model("google_genai:gemini-2.5-flash-lite")
-
-
-# ── Pydantic output schema ─────────────────────────────────────────────────────
-# Used with llm.with_structured_output() — Claude fills these via tool_use blocks.
-# LangChain parses and validates automatically. No fragile regex JSON extraction.
-
-class _SnapshotOut(BaseModel):
-    """One row per variant SKU."""
-    sku:                     str
-    product_title:           str
-    variant_title:           str
-    current_stock:           int  = Field(ge=0)
-    units_per_day:           float = Field(ge=0.0)
-    days_of_stock_remaining: float = Field(
-        description=(
-            "current_stock / units_per_day. "
-            "Set to 999.0 for zero-velocity SKUs (no sales in window)."
-        )
-    )
-    urgency: str = Field(
-        description=(
-            'Exactly one of: "critical" (<7 days), "high" (7–14 days), '
-            '"normal" (14–30 days or zero-velocity), "healthy" (>30 days).'
-        )
-    )
-
-
-class _AlertOut(BaseModel):
-    level:   str = Field(description='One of: "critical", "warning", "info"')
-    message: str = Field(description="Human-readable alert. Be specific — include SKU, numbers, urgency.")
-    sku:     Optional[str] = Field(default=None, description="SKU this alert relates to, if applicable.")
-
-
-class _InventoryAnalysis(BaseModel):
-    """Complete structured output the Inventory Agent produces."""
-    inventory_snapshots: list[_SnapshotOut] = Field(
-        description="One entry per active variant SKU. Include ALL variants."
-    )
-    alerts: list[_AlertOut] = Field(
-        description=(
-            "Raise only actionable alerts. "
-            "critical = stockout < 7 days. "
-            "warning  = dead stock (stock > 0, zero velocity 14+ days). "
-            "info     = size distribution anomaly (L/XL outselling S/M)."
-        )
-    )
-    summary: str = Field(
-        description=(
-            "2–3 sentence overview of overall inventory health. "
-            "Example: '14 SKUs healthy. 2 CRITICAL (restock in <7 days). "
-            "3 dead stock variants flagged for markdown review.'"
-        )
-    )
 
 
 # ── Subgraph State ─────────────────────────────────────────────────────────────
@@ -264,9 +213,9 @@ def load_domain_skill(state: InventoryAgentState) -> dict:
 # NODE 3 — run_claude_analysis
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def run_claude_analysis(state: InventoryAgentState) -> dict:
+async def run_chat_model_analysis(state: InventoryAgentState) -> dict:
     """
-    Calls Claude with a structured output schema to analyse inventory data.
+    Calls the chat model with a structured output schema to analyse inventory data.
 
     Design choices:
     - NOT a ReAct agent loop. The data is already in state from Node 1.
@@ -294,6 +243,8 @@ async def run_claude_analysis(state: InventoryAgentState) -> dict:
             sku = (variant.get("sku") or "").strip()
             if not sku:
                 continue  # skip variants with no SKU assigned
+            if variant.get("inventory_management") != "shopify":
+                continue  # skip untracked variants — inventory_quantity is meaningless
 
             stock    = variant.get("inventory_quantity", 0)
             velocity = velocity_by_sku.get(sku, 0.0)
@@ -315,9 +266,9 @@ async def run_claude_analysis(state: InventoryAgentState) -> dict:
     if not compact:
         # Edge case: store has no active products or all variants lack SKUs
         print("[Inventory] WARNING: No SKU data found. Check Shopify product setup.")
-        empty = _InventoryAnalysis(
+        empty = InventoryAnalysis(
             inventory_snapshots=[],
-            alerts=[_AlertOut(
+            alerts=[AlertOut(
                 level="warning",
                 message="No active SKUs found in Shopify. Ensure products have SKUs assigned.",
                 sku=None,
@@ -361,7 +312,7 @@ Rules:
     import re
 
     structured_llm = model.with_structured_output(
-        _InventoryAnalysis,
+        InventoryAnalysis,
         # method="json_schema",
         # include_raw=True,         # get raw response so we can inspect it
     )
@@ -379,7 +330,7 @@ Rules:
     # else:
     #     analysis = raw_result["parsed"]
 
-    analysis: _InventoryAnalysis = await structured_llm.ainvoke([
+    analysis: InventoryAnalysis = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_message),
     ])
@@ -409,7 +360,7 @@ def write_state_outputs(state: InventoryAgentState) -> dict:
     This means future parallel agents (Trend, Pricing, etc.) can all write to
     state.alerts without clobbering each other.
     """
-    analysis = _InventoryAnalysis.model_validate_json(state["raw_analysis"])
+    analysis = InventoryAnalysis.model_validate_json(state["raw_analysis"])
     now_iso  = datetime.now(timezone.utc).isoformat()
 
     # ── Build typed InventorySnapshot list ────────────────────────────────────
@@ -471,15 +422,15 @@ def build_inventory_graph() -> StateGraph:
     # Register nodes
     graph.add_node("fetch_shopify_data",  fetch_shopify_data)
     graph.add_node("load_domain_skill",   load_domain_skill)
-    graph.add_node("run_claude_analysis", run_claude_analysis)
+    graph.add_node("run_chat_model_analysis", run_chat_model_analysis)
     graph.add_node("write_state_outputs", write_state_outputs)
 
     # Wire edges — purely sequential for now
     # (Future: add conditional edges for error recovery, retry logic, etc.)
     graph.add_edge(START,                  "fetch_shopify_data")
     graph.add_edge("fetch_shopify_data",   "load_domain_skill")
-    graph.add_edge("load_domain_skill",    "run_claude_analysis")
-    graph.add_edge("run_claude_analysis",  "write_state_outputs")
+    graph.add_edge("load_domain_skill",    "run_chat_model_analysis")
+    graph.add_edge("run_chat_model_analysis",  "write_state_outputs")
     graph.add_edge("write_state_outputs",  END)
 
     return graph.compile()

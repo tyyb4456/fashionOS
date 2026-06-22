@@ -20,12 +20,15 @@ Port: 8002
 """
 
 import os
+import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+import redis.asyncio as _aioredis
 
 load_dotenv()
 
@@ -36,6 +39,7 @@ load_dotenv()
 import redis.asyncio as _aioredis
 
 _REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+_redis = _aioredis.from_url(_REDIS_URL, decode_responses=True)  # shared pool, not reconnected per call
 
 
 async def _get_brand_creds(brand_id: str) -> dict:
@@ -44,9 +48,8 @@ async def _get_brand_creds(brand_id: str) -> dict:
     The main API writes these when a brand is created or credentials are updated.
     Raises ValueError if brand_id is not found in cache — caller returns an error response.
     """
-    r = _aioredis.from_url(_REDIS_URL, decode_responses=True)
     try:
-        raw = await r.get(f"fashionos:creds:{brand_id}")
+        raw = await _redis.get(f"fashionos:creds:{brand_id}")
         if not raw:
             raise ValueError(
                 f"No credentials found for brand_id='{brand_id}'. "
@@ -55,16 +58,18 @@ async def _get_brand_creds(brand_id: str) -> dict:
         import json as _json
         return _json.loads(raw)
     finally:
-        await r.aclose()
+        await _redis.aclose()
 
 # ── Apify config (scraping) ───────────────────────────────────────────────────
 
 APIFY_TOKEN    = os.getenv("APIFY_API_TOKEN", "")
 APIFY_BASE_URL = "https://api.apify.com/v2"
+SCRAPE_TIMEOUT = 90  # was undefined -> NameError on every call before
 
 TIKTOK_ACTOR_ID    = os.getenv("APIFY_TIKTOK_ACTOR_ID",    "clockworks/free-tiktok-scraper")
 INSTAGRAM_ACTOR_ID = os.getenv("APIFY_INSTAGRAM_ACTOR_ID", "apify/instagram-hashtag-scraper")
-SCRAPE_TIMEOUT     = int(os.getenv("APIFY_SCRAPE_TIMEOUT_SECONDS", "90"))
+
+CACHE_TTL_SECONDS = 6 * 60 * 60  # trend data is stale-tolerant, don't re-pay Apify every request
 
 # ── Instagram Graph API config (DMs) ─────────────────────────────────────────
 
@@ -83,22 +88,50 @@ mcp = FastMCP(
     ),
 )
 
+async def _cache_get(key: str) -> Optional[list]:
+    raw = await _redis.get(key)
+    return json.loads(raw) if raw else None
+
+
+async def _cache_set(key: str, value: list):
+    await _redis.set(key, json.dumps(value), ex=CACHE_TTL_SECONDS)
+
+def _engagement_score(views: int, likes: int, comments: int, shares: int, created_at: str) -> float:
+    """Weighted engagement per hour since posting — surfaces what's *currently* gaining traction."""
+    try:
+        posted = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        hours = max(1.0, (datetime.now(timezone.utc) - posted).total_seconds() / 3600)
+    except Exception:
+        hours = 24.0
+    weighted = views * 1 + likes * 3 + comments * 5 + shares * 4
+    return weighted / hours
+
 
 # ── Apify HTTP helper ─────────────────────────────────────────────────────────
 
-async def _run_actor_sync(actor_id: str, run_input: dict, limit: int = 20) -> list[dict]:
+async def _run_actor_sync(actor_id: str, run_input: dict, limit: int = 20, retries: int = 2) -> list[dict]:
     if not APIFY_TOKEN:
         raise ValueError("APIFY_API_TOKEN not set in social-mcp .env")
 
     actor_id_url = actor_id.replace("/", "~")
-    url    = f"{APIFY_BASE_URL}/acts/{actor_id_url}/run-sync-get-dataset-items"
+    url = f"{APIFY_BASE_URL}/acts/{actor_id_url}/run-sync-get-dataset-items"
     params = {"token": APIFY_TOKEN, "maxItems": limit, "clean": "true"}
 
-
-    async with httpx.AsyncClient(timeout=SCRAPE_TIMEOUT + 15) as client:
-        r = await client.post(url, json=run_input, params=params)
-        r.raise_for_status()
-        return r.json()
+    last_exc = None
+    async with httpx.AsyncClient(timeout=SCRAPE_TIMEOUT) as client:
+        for attempt in range(retries + 1):
+            try:
+                r = await client.post(url, json=run_input, params=params)
+                r.raise_for_status()
+                return r.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in (429, 500, 502, 503):
+                    raise  # bad input etc — don't retry, fail fast
+                last_exc = exc
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+            await asyncio.sleep(2 ** attempt)
+    raise last_exc
 
 
 # ── Instagram Graph API helpers ───────────────────────────────────────────────
@@ -143,30 +176,26 @@ async def _ig_post(brand_id: str, path: str, payload: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def search_tiktok_hashtag(
-    hashtag: str,
-    limit:   int = 20,
-    geo:     str = "PK",
-) -> list[dict]:
+async def search_tiktok_hashtag(hashtag: str, limit: int = 20) -> list[dict]:
     """
-    Scrape TikTok posts for a hashtag and return normalised engagement signals.
+    Scrape TikTok posts for a hashtag, ranked by engagement velocity (highest first).
 
     Args:
         hashtag: Hashtag WITHOUT the # symbol. E.g. "PakistaniFashion"
         limit:   Max posts to return (default 20, capped at 50).
-        geo:     Country code for geo-targeting (default "PK").
 
-    Returns: platform, hashtag, post_id, text, author, views, likes, comments,
-             shares, created_at, hashtags[], music
-    On error: [{"error": "...", "hashtag": hashtag, "source": "tiktok"}]
+    Note: clockworks/free-tiktok-scraper has no geo/country input field — there's
+    no way to geo-filter this actor, so that param was removed rather than faked.
     """
+    
+    hashtag = hashtag.lstrip("#").strip().lower()
     limit = min(limit, 50)
-    run_input = {
-        "hashtags":        [hashtag],
-        "resultsPerPage":  limit,
-        "maxCrawledItems": limit,
-        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-    }
+    cache_key = f"fashionos:trend:tiktok:{hashtag}:{limit}"
+
+    if (cached := await _cache_get(cache_key)) is not None:
+        return cached
+
+    run_input = {"hashtags": [hashtag], "resultsPerPage": limit}
 
     try:
         raw_items = await _run_actor_sync(TIKTOK_ACTOR_ID, run_input, limit=limit)
@@ -175,66 +204,71 @@ async def search_tiktok_hashtag(
 
     results = []
     for item in raw_items[:limit]:
-        stats = item.get("stats", {})
+        views, likes = item.get("playCount", 0), item.get("diggCount", 0)
+        comments, shares = item.get("commentCount", 0), item.get("shareCount", 0)
+        created_at = item.get("createTimeISO", "")
         results.append({
-            "platform":   "tiktok",
-            "hashtag":    hashtag,
-            "post_id":    item.get("id", ""),
-            "text":       (item.get("text") or "")[:300],
-            "author":     item.get("authorMeta", {}).get("name", ""),
-            "views":      stats.get("playCount", 0),
-            "likes":      stats.get("diggCount", 0),
-            "comments":   stats.get("commentCount", 0),
-            "shares":     stats.get("shareCount", 0),
-            "created_at": item.get("createTimeISO", ""),
-            "hashtags":   [h.get("name", "") for h in item.get("hashtags", [])],
-            "music":      item.get("musicMeta", {}).get("musicName", ""),
+            "platform": "tiktok", "hashtag": hashtag, "post_id": item.get("id", ""),
+            "text": (item.get("text") or "")[:300],
+            "author": item.get("authorMeta", {}).get("name", ""),
+            "views": views, "likes": likes, "comments": comments, "shares": shares,
+            "created_at": created_at,
+            "hashtags": [h.get("name", "") for h in item.get("hashtags", [])],
+            "music": item.get("musicMeta", {}).get("musicName", ""),
+            "score": round(_engagement_score(views, likes, comments, shares, created_at), 2),
         })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    await _cache_set(cache_key, results)
     return results
 
 
 @mcp.tool()
-async def search_instagram_hashtag(
-    hashtag: str,
-    limit:   int = 20,
-) -> list[dict]:
+async def search_instagram_hashtag(hashtag: str, limit: int = 20) -> list[dict]:
     """
-    Scrape Instagram posts for a hashtag.
+    Scrape Instagram posts for a hashtag, ranked by engagement velocity.
 
     Args:
         hashtag: Hashtag WITHOUT the # symbol.
         limit:   Max posts (default 20, capped at 50).
 
-    Returns: platform, hashtag, post_id, shortcode, caption, likes, comments,
-             post_type, created_at, url
-    On error: [{"error": "...", "hashtag": hashtag, "source": "instagram"}]
+    IMPORTANT: apify/instagram-hashtag-scraper has NO top/recent sort — resultsType
+    only picks content type (posts/reels/stories). IG's hashtag page returns whatever
+    order Instagram gives it (skews recent/low-engagement), so we over-fetch 3x and
+    rank client-side.
     """
+    hashtag = hashtag.lstrip("#").strip().lower()
     limit = min(limit, 50)
-    run_input = {
-        "hashtags":     [hashtag],
-        "resultsLimit": limit,
-        "proxy":        {"useApifyProxy": True},
-    }
+    cache_key = f"fashionos:trend:instagram:{hashtag}:{limit}"
+
+    if (cached := await _cache_get(cache_key)) is not None:
+        return cached
+
+    fetch_limit = min(limit * 3, 150)
+    run_input = {"hashtags": [hashtag], "resultsType": "posts", "resultsLimit": fetch_limit}
 
     try:
-        raw_items = await _run_actor_sync(INSTAGRAM_ACTOR_ID, run_input, limit=limit)
+        raw_items = await _run_actor_sync(INSTAGRAM_ACTOR_ID, run_input, limit=fetch_limit)
     except Exception as exc:
         return [{"error": str(exc), "hashtag": hashtag, "source": "instagram"}]
 
     results = []
-    for item in raw_items[:limit]:
+    for item in raw_items:
+        likes, comments = item.get("likesCount", 0), item.get("commentsCount", 0)
+        created_at = item.get("timestamp", "")
         results.append({
-            "platform":   "instagram",
-            "hashtag":    hashtag,
-            "post_id":    item.get("id", ""),
-            "shortcode":  item.get("shortCode", ""),
-            "caption":    (item.get("caption") or "")[:300],
-            "likes":      item.get("likesCount", 0),
-            "comments":   item.get("commentsCount", 0),
-            "post_type":  item.get("type", "image"),
-            "created_at": item.get("timestamp", ""),
-            "url":        item.get("url", ""),
+            "platform": "instagram", "hashtag": hashtag, "post_id": item.get("id", ""),
+            "shortcode": item.get("shortCode", ""),
+            "caption": (item.get("caption") or "")[:300],
+            "likes": likes, "comments": comments,
+            "post_type": item.get("type", "image"),
+            "created_at": created_at, "url": item.get("url", ""),
+            "score": round(_engagement_score(0, likes, comments, 0, created_at), 2),
         })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    results = results[:limit]
+    await _cache_set(cache_key, results)
     return results
 
 
