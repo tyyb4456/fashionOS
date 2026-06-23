@@ -21,6 +21,9 @@ from deepagents.backends.utils import create_file_data
 from dotenv import load_dotenv
 from langgraph.store.redis.aio import AsyncRedisStore 
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+# Add this import at the top
+from langgraph.checkpoint.memory import InMemorySaver
 
 
 from deep_agents.subagents.inventory_agent import build_inventory_subagent
@@ -34,8 +37,28 @@ BASE_DIR        = Path(__file__).parent.resolve()
 SKILLS_DIR      = BASE_DIR / "skills"
 
 # ── Redis store — one instance for whole process ───────────────────────────────
-store = AsyncRedisStore(redis_url=REDIS_URL)
+# ADD lazy init:
+_store: AsyncRedisStore | None = None
 
+async def _get_store() -> AsyncRedisStore:
+    global _store
+    if _store is None:
+        _store = AsyncRedisStore(redis_url=REDIS_URL)
+        await _store.setup()          # setup once, here
+    return _store
+
+
+
+# NEW — lazy checkpointer (same pattern as _get_store)
+_checkpointer: AsyncRedisSaver | None = None
+
+async def _get_checkpointer() -> AsyncRedisSaver:
+    global _checkpointer
+    if _checkpointer is None:
+        _checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
+        await _checkpointer.asetup()   # creates Redis indices once
+        print("[Checkpointer] ✓ AsyncRedisSaver ready")
+    return _checkpointer
 
 # ── Per-brand agent cache ──────────────────────────────────────────────────────
 # key: brand_id → agent
@@ -48,53 +71,57 @@ def _seed_agents_md(brand_id: str, brand_name: str) -> str:
     return f"""# FashionOS Brand Memory — {brand_name}
 
 ## Brand Identity
-- brand_id  : {brand_id}
+- brand_id: {brand_id}
 - brand_name: {brand_name}
-- Platform  : Shopify + Meta Ads + Instagram
-- Currency  : PKR (Pakistani Rupee)
-- Market    : Pakistani fashion e-commerce
+- platform: Shopify + Meta Ads + Instagram
+- currency: PKR (Pakistani Rupee)
+- market: Pakistani fashion e-commerce
 
-## Founder Preferences
-<!-- Agent updates this as it learns. Examples:
-- Prefers bundles over clearance codes for dead stock
-- Wants bullet-point summaries only
-- Critical alerts → WhatsApp only -->
+## Owner Preferences
+<!-- Update when you learn something new about the brand owner.
+Examples:
+- prefers: bullet-point summaries only
+- alert_channel: WhatsApp for critical alerts
+- name: Tayyab -->
 
-## Brand-Specific Rules
-<!-- Overrides of global FashionOS defaults:
-- Min margin floor: 38%
-- Never increase ad budget on Fridays
-- Price endings: always PKR X99 or X499 -->
+## Brand Rules
+<!-- Overrides of global FashionOS defaults.
+Examples:
+- min_margin_floor: 38%
+- price_endings: always PKR X99 or X499
+- no_ad_budget_increase_on: Fridays -->
 
 ## Supplier Notes
-<!-- Agent records supplier facts:
-- Primary: Ahmed at Shadman Market, 5-day lead -->
+<!-- Example: primary_supplier: Ahmed at Shadman Market, 5-day lead time -->
 
-## Seasonal Patterns Observed
-<!-- Agent records patterns over time:
-- Eid run-up (2 weeks before): velocity 3x normal -->
+## Seasonal Patterns
+<!-- Example: eid_velocity_multiplier: 3x normal (2 weeks before Eid) -->
 
 ## Past Decisions Log
-<!-- Agent logs major decisions to prevent repeating bad ones -->
+<!-- Agent logs major decisions to avoid repeating bad ones -->
 """
 
 
-async def _ensure_brand_seeded(brand_id: str, brand_name: str) -> None:
-    """
-    Seeds /memories/AGENTS.md into Redis for a brand if not already there.
-    Key in Redis: namespace=(brand_id,), key="/memories/AGENTS.md"
-    """
+async def _ensure_brand_seeded(brand_id: str, brand_name: str, store: AsyncRedisStore) -> None:
     namespace = (brand_id,)
-    key       = "/memories/AGENTS.md"
+    key       = "/AGENTS.md"
 
-    existing = await store.aget(namespace, key)   # async get
-    if existing is None:
-        await store.aput(                          # async put
-            namespace,
-            key,
-            create_file_data(_seed_agents_md(brand_id, brand_name)),
-        )
-        print(f"[Memory] ✓ Seeded AGENTS.md for brand={brand_id} in Redis")
+    existing   = await store.aget(namespace, key)
+    needs_seed = existing is None
+
+    if not needs_seed and existing:
+        # Item object — access .value, not .get()
+        file_data = existing.value or {}
+        content   = file_data.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(content)
+        if "brand_id  :" in content or "brand_name:" in content:
+            needs_seed = True
+            print(f"[Memory] ↺ Re-seeding AGENTS.md for brand={brand_id} (stale format)")
+
+    if needs_seed:
+        await store.aput(namespace, key, create_file_data(_seed_agents_md(brand_id, brand_name)))
+        print(f"[Memory] ✓ Seeded AGENTS.md for brand={brand_id}")
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -105,10 +132,20 @@ You are FashionOS Supervisor — the autonomous AI brain of a Pakistani Shopify 
 ## Memory
 
 ### Long-term (persists across ALL conversations)
-/memories/AGENTS.md is injected at startup. Contains brand rules, preferences,
-supplier contacts, seasonal patterns, and past decisions.
-UPDATE when you learn something new:
-  edit_file("/memories/AGENTS.md", old_text, new_text)
+/memories/AGENTS.md is injected at startup. Contains brand identity, owner preferences,
+rules, suppliers, seasonal patterns, and past decisions.
+
+You MUST update it when you learn ANYTHING new — including:
+- Owner's name, nickname, or personal preferences
+- Brand rule changes or new decisions
+- Supplier or pricing updates
+
+How to update (ALWAYS read the file first to get exact text):
+  read_file("/memories/AGENTS.md")          ← get exact current content
+  edit_file("/memories/AGENTS.md", exact_old_text, new_text)
+
+IMPORTANT: The old_text you pass to edit_file MUST be character-for-character identical
+to what you just read. Copy-paste the line, do not retype it.
 
 ### Short-term (this conversation only)
 Conversation history is automatic — no action needed.
@@ -119,7 +156,7 @@ DB tools give you latest pipeline results (inventory, alerts, pricing, content).
 ## Tool strategy
 - Existing data (fast)  → DB tools
 - Fresh live analysis   → delegate to subagents
-- Learn something new   → edit_file("/memories/AGENTS.md", ...)
+- Learn something new   → read_file then edit_file on /memories/AGENTS.md
 
 ## Output format
 ✘ CRITICAL  (action needed today)
@@ -134,8 +171,8 @@ Always include real numbers (stock, velocity, PKR, days).
 3. /memories/AGENTS.md overrides all global defaults for this brand.
 4. Never write to /skills/ — read-only.
 5. Always pass brand_id=BRAND_ID to every DB tool call.
+6. When updating /memories/AGENTS.md, ALWAYS read it first to get exact line content.
 """
-
 
 def _build_prompt(brand_id: str, brand_name: str) -> str:
     header = (
@@ -151,10 +188,11 @@ def _build_prompt(brand_id: str, brand_name: str) -> str:
 
 async def _build_supervisor(brand_id: str, brand_name: str):
 
-    await store.setup()
+    store = await _get_store()  
+    checkpointer = await _get_checkpointer()
 
     # Seed brand memory into store if first time
-    _ensure_brand_seeded(brand_id, brand_name)
+    await _ensure_brand_seeded(brand_id, brand_name, store)
 
     client    = MultiServerMCPClient(
         {"shopify": {"url": SHOPIFY_MCP_URL, "transport": "streamable_http"}}
@@ -174,6 +212,7 @@ async def _build_supervisor(brand_id: str, brand_name: str):
             # SKILLS → FilesystemBackend (static files on disk, read-only)
             "/skills/": FilesystemBackend(
                 root_dir=str(SKILLS_DIR),
+                virtual_mode=True,   # ← explicit, silences the warning
             ),
         },
     )
@@ -188,7 +227,7 @@ async def _build_supervisor(brand_id: str, brand_name: str):
         store         = store,                    #  the actual persistent store -- Redis store
         memory        = ["/memories/AGENTS.md"],  #  long-term, loaded at startup
         skills        = ["/skills/"],
-        #  NO checkpointer — short-term is automatic via thread_id
+        checkpointer  = checkpointer, 
         permissions   = [
             FilesystemPermission(
                 operations=["write", "edit"],
@@ -237,8 +276,10 @@ async def chat(
 
 async def _cli():
     import sys, uuid
-    brand_id   = os.getenv("BRAND_ID",   "brand_dev")
-    brand_name = os.getenv("BRAND_NAME", "Dev Brand")
+    # brand_id   = os.getenv("BRAND_ID",   "brand_user_3fe1ek8")
+    # brand_name = os.getenv("BRAND_NAME", "Dev Brand")
+    brand_id = "bra_2"
+    brand_name = "bra_3"
 
     if len(sys.argv) >= 3:
         brand_id, brand_name = sys.argv[1], sys.argv[2]
