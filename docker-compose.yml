@@ -163,6 +163,8 @@ services:
   #     container_name: fashionos_worker
   #     command: ["worker-beat"]
   #     env_file: .env
+  #     volumes:
+  #     - ./deep_agents/memory:/app/deep_agents/memory
   #     environment:
   #       REDIS_URL: redis://redis:6379/0        # ← service name, not localhost
   #       DATABASE_URL: postgresql+asyncpg://fashionos:fashionos_dev@postgres:5432/fashionos
