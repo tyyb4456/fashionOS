@@ -26,15 +26,29 @@ from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from deep_agents.subagents.inventory_agent import build_inventory_subagent
 from deep_agents.subagents.trend_agent import build_trend_subagent
 from deep_agents.subagents.pricing_agent import build_pricing_subagent
-from deep_agents.subagents.marketing_agent import build_marketing_subagent   # ← NEW
+from deep_agents.subagents.marketing_agent import build_marketing_subagent   
 from deep_agents.tools.db_tools import get_db_tools
+from deep_agents.subagents.content_agent import build_content_subagent
+
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+
+llm = HuggingFaceEndpoint(
+    repo_id="deepseek-ai/DeepSeek-R1-0528",
+    task="text-generation",
+    max_new_tokens=512,
+    do_sample=False,
+    repetition_penalty=1.03,
+    provider="auto",  # let Hugging Face choose the best provider for you
+)
+
+chat_model = ChatHuggingFace(llm=llm)
 
 load_dotenv()
 
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
 SOCIAL_MCP_URL  = os.getenv("SOCIAL_MCP_URL",  "http://localhost:8002/mcp")
 TRENDS_MCP_URL  = os.getenv("TRENDS_MCP_URL",  "http://localhost:8003/mcp")
-ADS_MCP_URL     = os.getenv("ADS_MCP_URL",     "http://localhost:8004/mcp")   # ← NEW
+ADS_MCP_URL     = os.getenv("ADS_MCP_URL",     "http://localhost:8004/mcp")   
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 BASE_DIR        = Path(__file__).parent.resolve()
 SKILLS_DIR      = BASE_DIR / "skills"
@@ -217,13 +231,44 @@ marketing-agent:
   If any upstream result is missing, call get_inventory_status() as fallback for inventory.
 
 
+content-agent:
+  # Call AFTER inventory, trend, pricing, AND marketing agents.
+  # Needs clearance flags (pricing) to skip contradictions,
+  # and campaign status (marketing) for content-ad sync.
+  task(
+      name="content-agent",
+      task=(
+          "Generate content plan for {brand_name} (brand_id={brand_id}). "
+          "current_date: {YYYY-MM-DD} "
+          "inventory_snapshot: {inventory_json} "
+          "trend_signals: {trend_signals_json} "
+          "pricing_recommendations: {pricing_json} "
+          "marketing_actions: {marketing_json} "
+          "return_insights: {return_insights_json} "
+          "Select candidates, generate Instagram + TikTok content, return ContentPlan."
+      )
+  )
+  → priority_today_skus = what to film and post TODAY
+  → posts = full captions + TikTok scripts + shot lists per SKU
+  → fatigue_skips = why any eligible SKU was excluded (check here before re-running)
+  → pass return_insights=[] if returns-agent hasn't run yet (gracefully handled)
+
+  Build {marketing_json} from marketing-agent result decisions array (or [] if unavailable).
+  Build {return_insights_json} from returns-agent result return_insights (or [] if unavailable).
+  Always inject current_date as YYYY-MM-DD string.
+
+
 ## Full daily pipeline order
   1. inventory-agent   → inventory_snapshot
   2. trend-agent       → trend_signals (pass catalog from inventory-agent)
   3. pricing-agent     → pricing_recommendations (pass both above)
   4. marketing-agent   → marketing_analysis (pass all three above)
+  5. content-agent     → content_plan (pass all four above + return_insights if available)
 
-Run 1→4 in sequence. Each agent's output feeds the next.
+Run 1→5 in sequence. Each agent's output feeds the next.
+Content is last because it benefits from all upstream context — especially clearance flags
+(pricing) and campaign status (marketing) to avoid contradictory signals.
+
 
 
 ## Output format
@@ -287,6 +332,8 @@ async def _build_supervisor(brand_id: str, brand_name: str):
     ads_tools          = await ads_client.get_tools()
     marketing_subagent = await build_marketing_subagent(ads_tools)
 
+    content_subagent = await build_content_subagent([])
+
     # ── Backend ────────────────────────────────────────────────────────────────
     backend = CompositeBackend(
         default=StateBackend(),
@@ -303,14 +350,16 @@ async def _build_supervisor(brand_id: str, brand_name: str):
 
     agent = create_deep_agent(
         name          = f"fashionos-{brand_id}",
-        model         = "google_genai:gemini-2.5-flash-lite",
+        # model         = "google_genai:gemini-2.5-flash-lite",
+        model         = chat_model,
         system_prompt = _build_prompt(brand_id, brand_name),
         tools         = get_db_tools(),
         subagents     = [
             inventory_subagent,
             trend_subagent,
             pricing_subagent,
-            marketing_subagent,       
+            marketing_subagent,      
+            content_subagent,  
         ],
         backend       = backend,
         store         = store,                    #  the actual persistent store -- Redis store
