@@ -19,14 +19,14 @@ from deepagents import FilesystemPermission, create_deep_agent
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend, FilesystemBackend
 from deepagents.backends.utils import create_file_data
 from dotenv import load_dotenv
-from langgraph.store.redis.aio import AsyncRedisStore 
+from langgraph.store.redis.aio import AsyncRedisStore
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-from deep_agents.subagents.trend_agent import build_trend_subagent
-from deep_agents.subagents.pricing_agent import build_pricing_subagent
-
 
 from deep_agents.subagents.inventory_agent import build_inventory_subagent
+from deep_agents.subagents.trend_agent import build_trend_subagent
+from deep_agents.subagents.pricing_agent import build_pricing_subagent
+from deep_agents.subagents.marketing_agent import build_marketing_subagent   # ← NEW
 from deep_agents.tools.db_tools import get_db_tools
 
 load_dotenv()
@@ -34,36 +34,33 @@ load_dotenv()
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
 SOCIAL_MCP_URL  = os.getenv("SOCIAL_MCP_URL",  "http://localhost:8002/mcp")
 TRENDS_MCP_URL  = os.getenv("TRENDS_MCP_URL",  "http://localhost:8003/mcp")
+ADS_MCP_URL     = os.getenv("ADS_MCP_URL",     "http://localhost:8004/mcp")   # ← NEW
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 BASE_DIR        = Path(__file__).parent.resolve()
 SKILLS_DIR      = BASE_DIR / "skills"
 
 # ── Redis store — one instance for whole process ───────────────────────────────
-# ADD lazy init:
 _store: AsyncRedisStore | None = None
 
 async def _get_store() -> AsyncRedisStore:
     global _store
     if _store is None:
         _store = AsyncRedisStore(redis_url=REDIS_URL)
-        await _store.setup()          # setup once, here
+        await _store.setup()
     return _store
 
 
-
-# NEW — lazy checkpointer (same pattern as _get_store)
 _checkpointer: AsyncRedisSaver | None = None
 
 async def _get_checkpointer() -> AsyncRedisSaver:
     global _checkpointer
     if _checkpointer is None:
         _checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
-        await _checkpointer.asetup()   # creates Redis indices once
+        await _checkpointer.asetup()
         print("[Checkpointer] ✓ AsyncRedisSaver ready")
     return _checkpointer
 
 # ── Per-brand agent cache ──────────────────────────────────────────────────────
-# key: brand_id → agent
 _agent_cache: dict[str, object] = {}
 
 
@@ -112,7 +109,6 @@ async def _ensure_brand_seeded(brand_id: str, brand_name: str, store: AsyncRedis
     needs_seed = existing is None
 
     if not needs_seed and existing:
-        # Item object — access .value, not .get()
         file_data = existing.value or {}
         content   = file_data.get("content", "")
         if isinstance(content, list):
@@ -176,7 +172,7 @@ trend-agent:
   )
   → returns scored trend signals, catalog matches, new product opportunities
   → build compact_catalog_json from get_inventory_status() results:
-    [{{"sku": s["sku"], "product_title": s["product"], "variant_title": s["variant"]}} 
+    [{{"sku": s["sku"], "product_title": s["product"], "variant_title": s["variant"]}}
      for s in inventory["skus"]]
   → always call get_inventory_status() first to get the catalog before calling trend-agent
 
@@ -196,12 +192,46 @@ pricing-agent:
   → returns what ran (executed=True) vs what needs approval (auto_execute=False)
   → check failed_count in result — any > 0 means Shopify write errors occurred
 
+
+marketing-agent:
+  # Always call AFTER inventory-agent, trend-agent, AND pricing-agent.
+  # Marketing needs clearance flags from pricing to avoid running ads on cleared stock.
+  task(
+      name="marketing-agent",
+      task=(
+          "Run Meta ad campaign analysis for {brand_name} (brand_id={brand_id}). "
+          "inventory_snapshot: {inventory_json} "
+          "trend_signals: {trend_signals_json} "
+          "pricing_recommendations: {pricing_json} "
+          "Fetch campaign data, make decisions, execute approved actions, return analysis."
+      )
+  )
+  → auto-executes: pause (OOS/clearance/very_low_roas), decrease_budget (organic_viral/low_roas ≤30%)
+  → pending approval: increase_budget (any %), activate (any condition)
+  → budget changes rounded to PKR 50, min PKR 200, max ±30% per cycle
+  → check failed_count in result — any > 0 means Meta API errors occurred
+  → non-compliant campaign names (no SKU match) are held — flag to founder for renaming
+
+  Build {pricing_json} from pricing-agent result decisions array.
+  Build {inventory_json} and {trend_signals_json} from prior agents in this run.
+  If any upstream result is missing, call get_inventory_status() as fallback for inventory.
+
+
+## Full daily pipeline order
+  1. inventory-agent   → inventory_snapshot
+  2. trend-agent       → trend_signals (pass catalog from inventory-agent)
+  3. pricing-agent     → pricing_recommendations (pass both above)
+  4. marketing-agent   → marketing_analysis (pass all three above)
+
+Run 1→4 in sequence. Each agent's output feeds the next.
+
+
 ## Output format
 ✘ CRITICAL  (action needed today)
 ⚠ WARNING   (action needed this week)
 ✔ HEALTHY    (no action needed)
 
-Always include real numbers (stock, velocity, PKR, days).
+Always include real numbers (stock, velocity, PKR, days, ROAS).
 
 ## Hard rules
 1. Never call Shopify or Meta APIs directly — delegate to subagents.
@@ -210,6 +240,7 @@ Always include real numbers (stock, velocity, PKR, days).
 4. Never write to /skills/ — read-only.
 5. Always pass brand_id=BRAND_ID to every DB tool call.
 6. When updating /memories/AGENTS.md, ALWAYS read it first to get exact line content.
+7. marketing-agent must ALWAYS run after pricing-agent — it needs clearance flags.
 """
 
 def _build_prompt(brand_id: str, brand_name: str) -> str:
@@ -226,39 +257,46 @@ def _build_prompt(brand_id: str, brand_name: str) -> str:
 
 async def _build_supervisor(brand_id: str, brand_name: str):
 
-    store = await _get_store()  
+    store        = await _get_store()
     checkpointer = await _get_checkpointer()
 
     # Seed brand memory into store if first time
     await _ensure_brand_seeded(brand_id, brand_name, store)
 
-    shopify_client    = MultiServerMCPClient(
+    # ── Shopify client — shared by inventory + pricing subagents ───────────────
+    shopify_client = MultiServerMCPClient(
         {"shopify": {"url": SHOPIFY_MCP_URL, "transport": "streamable_http"}}
     )
     shopify_tools = await shopify_client.get_tools()
-    inventory_subagent = await build_inventory_subagent(shopify_tools)
 
+    inventory_subagent = await build_inventory_subagent(shopify_tools)
+    pricing_subagent   = await build_pricing_subagent(shopify_tools)
+
+    # ── Social + Trends client — for trend subagent ────────────────────────────
     trend_client = MultiServerMCPClient({
         "social": {"url": SOCIAL_MCP_URL, "transport": "http"},
         "trends": {"url": TRENDS_MCP_URL, "transport": "http"},
     })
-    trend_tools = await trend_client.get_tools()
+    trend_tools    = await trend_client.get_tools()
     trend_subagent = await build_trend_subagent(trend_tools)
 
-    pricing_subagent = await build_pricing_subagent(shopify_tools)
+    # ── Ads client — for marketing subagent ───────────────────────────────────
+    ads_client = MultiServerMCPClient(
+        {"ads": {"url": ADS_MCP_URL, "transport": "streamable_http"}}
+    )
+    ads_tools          = await ads_client.get_tools()
+    marketing_subagent = await build_marketing_subagent(ads_tools)
 
+    # ── Backend ────────────────────────────────────────────────────────────────
     backend = CompositeBackend(
         default=StateBackend(),
-
         routes={
-            # LONG-TERM memory → StoreBackend (persists per brand)  VIRTUAL — lives in Redis, keyed by brand_id
             "/memories/": StoreBackend(
                 namespace=lambda rt: (brand_id,),
             ),
-            # SKILLS → FilesystemBackend (static files on disk, read-only)
             "/skills/": FilesystemBackend(
                 root_dir=str(SKILLS_DIR),
-                virtual_mode=True,   # ← explicit, silences the warning
+                virtual_mode=True,
             ),
         },
     )
@@ -268,12 +306,17 @@ async def _build_supervisor(brand_id: str, brand_name: str):
         model         = "google_genai:gemini-2.5-flash-lite",
         system_prompt = _build_prompt(brand_id, brand_name),
         tools         = get_db_tools(),
-        subagents     = [inventory_subagent, trend_subagent, pricing_subagent],
+        subagents     = [
+            inventory_subagent,
+            trend_subagent,
+            pricing_subagent,
+            marketing_subagent,       
+        ],
         backend       = backend,
         store         = store,                    #  the actual persistent store -- Redis store
         memory        = ["/memories/AGENTS.md"],  #  long-term, loaded at startup
         skills        = ["/skills/"],
-        checkpointer  = checkpointer, 
+        checkpointer  = checkpointer,
         permissions   = [
             FilesystemPermission(
                 operations=["write", "edit"],
@@ -303,7 +346,6 @@ async def chat(
 ) -> str:
     agent = await _get_cached_agent(brand_id, brand_name)
 
-    # brand_id prefix = cross-tenant isolation
     scoped_thread = f"{brand_id}:{thread_id}"
     config        = {"configurable": {"thread_id": scoped_thread}}
 
@@ -322,9 +364,8 @@ async def chat(
 
 async def _cli():
     import sys, uuid
-    # brand_id   = os.getenv("BRAND_ID",   "brand_user_3fe1ek8")
-    # brand_name = os.getenv("BRAND_NAME", "Dev Brand")
-    brand_id = "bra_2"
+
+    brand_id   = "bra_2"
     brand_name = "bra_3"
 
     if len(sys.argv) >= 3:
@@ -334,7 +375,6 @@ async def _cli():
 
     print(f"\n{'═' * 60}")
     print(f"  FashionOS Supervisor — {brand_name} ({brand_id})")
-    print(f"  Store  : InMemoryStore (swap → RedisStore in prod)")
     print(f"  Session: {brand_id}:{session_id}")
     print(f"  Type 'quit' to exit | 'reset' to start new session")
     print(f"{'═' * 60}\n")
