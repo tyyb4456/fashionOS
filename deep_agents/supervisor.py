@@ -9,11 +9,25 @@ LONG-TERM:   StoreBackend keyed by brand_id namespace.
              Agent edits this file as it learns. Seeded on first brand creation.
 
 EPHEMERAL:   StateBackend() for /workspace/ scratch. Gone after conversation.
+
+================================================
+Updated with streaming support via astream().
+
+stream_chat() yields SSE-ready dicts:
+  {"type": "token",          "content": "..."}
+  {"type": "subagent_start", "name": "inventory-agent"}
+  {"type": "subagent_token", "name": "inventory-agent", "content": "..."}
+  {"type": "subagent_done",  "name": "inventory-agent", "summary": "..."}
+  {"type": "done"}
+
 """
 
 import os
 import asyncio
 from pathlib import Path
+import json
+from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
 
 from deepagents import FilesystemPermission, create_deep_agent
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend, FilesystemBackend
@@ -53,7 +67,21 @@ REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 BASE_DIR        = Path(__file__).parent.resolve()
 SKILLS_DIR      = BASE_DIR / "skills"
 
-# ── Redis store — one instance for whole process ───────────────────────────────
+# Known subagent node names (must match the `name` field in each subagent dict)
+SUBAGENT_NAMES = {
+    "inventory-agent",
+    "trend-agent",
+    "pricing-agent",
+    "marketing-agent",
+    "content-agent",
+}
+
+# Redis namespace prefix for conversation metadata (separate from brand memory)
+_CONVOS_NS = "convos"
+
+
+# ── Singletons ────────────────────────────────────────────────────────────────
+
 _store: AsyncRedisStore | None = None
 
 async def _get_store() -> AsyncRedisStore:
@@ -73,6 +101,9 @@ async def _get_checkpointer() -> AsyncRedisSaver:
         await _checkpointer.asetup()
         print("[Checkpointer] ✓ AsyncRedisSaver ready")
     return _checkpointer
+
+
+_agent_cache: dict[str, object] = {}
 
 # ── Per-brand agent cache ──────────────────────────────────────────────────────
 _agent_cache: dict[str, object] = {}
@@ -115,25 +146,37 @@ Examples:
 """
 
 
+# async def _ensure_brand_seeded(brand_id: str, brand_name: str, store: AsyncRedisStore) -> None:
+#     namespace = (brand_id,)
+#     key       = "/AGENTS.md"
+
+#     existing   = await store.aget(namespace, key)
+#     needs_seed = existing is None
+
+#     if not needs_seed and existing:
+#         file_data = existing.value or {}
+#         content   = file_data.get("content", "")
+#         if isinstance(content, list):
+#             content = "\n".join(content)
+#         if "brand_id  :" in content or "brand_name:" in content:
+#             needs_seed = True
+#             print(f"[Memory] ↺ Re-seeding AGENTS.md for brand={brand_id} (stale format)")
+
+#     if needs_seed:
+#         await store.aput(namespace, key, create_file_data(_seed_agents_md(brand_id, brand_name)))
+        # print(f"[Memory] ✓ Seeded AGENTS.md for brand={brand_id}")
+
+
 async def _ensure_brand_seeded(brand_id: str, brand_name: str, store: AsyncRedisStore) -> None:
     namespace = (brand_id,)
     key       = "/AGENTS.md"
 
-    existing   = await store.aget(namespace, key)
-    needs_seed = existing is None
-
-    if not needs_seed and existing:
-        file_data = existing.value or {}
-        content   = file_data.get("content", "")
-        if isinstance(content, list):
-            content = "\n".join(content)
-        if "brand_id  :" in content or "brand_name:" in content:
-            needs_seed = True
-            print(f"[Memory] ↺ Re-seeding AGENTS.md for brand={brand_id} (stale format)")
-
-    if needs_seed:
+    existing = await store.aget(namespace, key)
+    if existing is None:
         await store.aput(namespace, key, create_file_data(_seed_agents_md(brand_id, brand_name)))
         print(f"[Memory] ✓ Seeded AGENTS.md for brand={brand_id}")
+    else:
+        print(f"[Memory] ✓ AGENTS.md already exists for brand={brand_id}, skipping seed")
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -350,8 +393,8 @@ async def _build_supervisor(brand_id: str, brand_name: str):
 
     agent = create_deep_agent(
         name          = f"fashionos-{brand_id}",
-        # model         = "google_genai:gemini-2.5-flash-lite",
-        model         = chat_model,
+        model         = "google_genai:gemini-2.5-flash-lite",
+        # model         = chat_model,
         system_prompt = _build_prompt(brand_id, brand_name),
         tools         = get_db_tools(),
         subagents     = [
@@ -385,7 +428,170 @@ async def _get_cached_agent(brand_id: str, brand_name: str):
     return _agent_cache[brand_id]
 
 
-# ── Public chat interface ──────────────────────────────────────────────────────
+# ── Conversation metadata helpers (stored in Redis via AsyncRedisStore) ────────
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def save_conversation_meta(
+    brand_id:  str,
+    thread_id: str,
+    title:     str,
+) -> None:
+    """
+    Upsert conversation metadata in Redis.
+    Namespace: (_CONVOS_NS, brand_id)   Key: thread_id
+    Preserves created_at on updates.
+    """
+    store     = await _get_store()
+    namespace = (_CONVOS_NS, brand_id)
+    now       = _now_iso()
+
+    existing   = await store.aget(namespace, thread_id)
+    created_at = (existing.value or {}).get("created_at", now) if existing else now
+
+    await store.aput(namespace, thread_id, {
+        "thread_id":  thread_id,
+        "title":      title[:80],
+        "created_at": created_at,
+        "updated_at": now,
+    })
+
+
+async def list_conversations(brand_id: str) -> list[dict]:
+    """
+    Return all conversations for a brand, sorted newest-first by updated_at.
+    Filters out soft-deleted records and any items missing required fields.
+    """
+    store     = await _get_store()
+    namespace = (_CONVOS_NS, brand_id)
+    items     = await store.asearch(namespace, limit=200)
+
+    _REQUIRED = {"thread_id", "title", "created_at", "updated_at"}
+    convos = [
+        item.value for item in items
+        if item.value
+        and not item.value.get("_deleted")
+        and _REQUIRED.issubset(item.value.keys())
+    ]
+    return sorted(convos, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+
+async def delete_conversation(brand_id: str, thread_id: str) -> None:
+    """
+    Remove conversation metadata from Redis.
+
+    Tries hard-delete via store.adelete first.
+    Falls back to a soft-delete marker so list_conversations() filters it out —
+    this covers LangGraph versions where adelete may not be implemented.
+    """
+    store     = await _get_store()
+    namespace = (_CONVOS_NS, brand_id)
+
+    deleted = False
+    try:
+        await store.adelete(namespace, thread_id)
+        deleted = True
+        print(f"[Convos] hard-deleted {thread_id} for brand={brand_id}")
+    except Exception as exc:
+        print(f"[Convos] adelete unavailable ({exc}), using soft-delete marker")
+
+    if not deleted:
+        # Soft-delete: mark the record; list_conversations filters these out
+        try:
+            await store.aput(namespace, thread_id, {"_deleted": True})
+        except Exception as exc2:
+            print(f"[Convos] soft-delete also failed: {exc2}")
+            raise
+
+
+async def _extract_messages(raw_messages: list) -> list[dict]:
+    """
+    Shared helper: turn a list of LangChain message objects or raw dicts
+    into [{role, content}] — human + ai only.
+    """
+    result: list[dict] = []
+    for msg in raw_messages:
+        # LangChain objects expose .type; raw dicts from Redis use "type" key
+        if isinstance(msg, dict):
+            msg_type = msg.get("type", "")
+            content  = msg.get("content", "")
+        else:
+            # Proper LangChain objects: HumanMessage.type="human", AIMessage.type="ai"
+            msg_type = getattr(msg, "type", "") or ""
+            if not msg_type:
+                # Older versions may not have .type — fall back to class name
+                cls      = msg.__class__.__name__
+                msg_type = "human" if "Human" in cls else ("ai" if "AI" in cls else "other")
+            content = getattr(msg, "content", "") or ""
+
+        if msg_type not in ("human", "ai"):
+            continue  # skip tool, system, function messages
+
+        # Flatten multi-modal / list content to plain text
+        if isinstance(content, list):
+            content = "".join(
+                c.get("text", "") if isinstance(c, dict) else str(c)
+                for c in content
+            )
+
+        result.append({
+            "role":    "user" if msg_type == "human" else "assistant",
+            "content": str(content).strip(),
+        })
+    return result
+
+
+async def get_thread_messages(
+    brand_id:   str,
+    brand_name: str,
+    thread_id:  str,
+) -> list[dict]:
+    """
+    Replay the human + AI messages for a thread.
+
+    Strategy (most reliable first):
+      1. agent.aget_state()  — fully deserialized LangChain message objects
+      2. checkpointer.aget_tuple() — raw checkpoint, channel_values.messages
+    Both fall back gracefully and return [] on failure.
+    """
+    scoped_thread = f"{brand_id}:{thread_id}"
+    config        = {"configurable": {"thread_id": scoped_thread}}
+
+    # ── Primary: use the compiled graph's aget_state ──────────────────────────
+    try:
+        agent        = await _get_cached_agent(brand_id, brand_name)
+        state        = await agent.aget_state(config)
+        raw_messages = (state.values or {}).get("messages", []) if state else []
+        if raw_messages:
+            result = await _extract_messages(raw_messages)
+            print(f"[Convos] aget_state returned {len(result)} messages for {thread_id}")
+            return result
+        print(f"[Convos] aget_state returned 0 messages for {thread_id}, trying checkpointer")
+    except Exception as exc:
+        print(f"[Convos] aget_state failed ({exc}), falling back to checkpointer")
+
+    # ── Fallback: read checkpoint directly ─────────────────────────────────────
+    try:
+        checkpointer = await _get_checkpointer()
+        cp_tuple     = await checkpointer.aget_tuple(config)
+        if not cp_tuple:
+            print(f"[Convos] no checkpoint found for {thread_id}")
+            return []
+
+        checkpoint   = cp_tuple.checkpoint or {}
+        # LangGraph stores graph state in channel_values
+        raw_messages = (checkpoint.get("channel_values") or {}).get("messages", [])
+        result = await _extract_messages(raw_messages)
+        print(f"[Convos] checkpoint fallback returned {len(result)} messages for {thread_id}")
+        return result
+    except Exception as exc:
+        print(f"[Convos] checkpoint fallback failed: {exc}")
+        return []
+
+
+# ── Public chat — non-streaming ───────────────────────────────────────────────
 
 async def chat(
     brand_id:   str,
@@ -393,8 +599,7 @@ async def chat(
     message:    str,
     thread_id:  str = "default",
 ) -> str:
-    agent = await _get_cached_agent(brand_id, brand_name)
-
+    agent         = await _get_cached_agent(brand_id, brand_name)
     scoped_thread = f"{brand_id}:{thread_id}"
     config        = {"configurable": {"thread_id": scoped_thread}}
 
@@ -409,24 +614,111 @@ async def chat(
     return "No response generated."
 
 
+# ── Public chat — streaming ───────────────────────────────────────────────────
+
+async def stream_chat(
+    brand_id:   str,
+    brand_name: str,
+    message:    str,
+    thread_id:  str = "default",
+) -> AsyncGenerator[dict, None]:
+    """
+    Yields SSE-ready event dicts. See module docstring for event types.
+    """
+    agent         = await _get_cached_agent(brand_id, brand_name)
+    scoped_thread = f"{brand_id}:{thread_id}"
+    config        = {"configurable": {"thread_id": scoped_thread}}
+
+    active_subagents: set[str]  = set()
+    subagent_buffers: dict[str, str] = {}
+
+    try:
+        async for chunk in agent.astream(
+            {"messages": [{"role": "user", "content": message}]},
+            config=config,
+            stream_mode="messages",
+        ):
+            if not isinstance(chunk, tuple) or len(chunk) != 2:
+                continue
+
+            msg_chunk, metadata = chunk
+            node: str = metadata.get("langgraph_node", "") or ""
+
+            # ── Text content ───────────────────────────────────────────────
+            raw = getattr(msg_chunk, "content", "") or ""
+            text = (
+                "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in raw)
+                if isinstance(raw, list) else str(raw)
+            )
+
+            # ── Detect task-tool delegation ────────────────────────────────
+            for tc in (getattr(msg_chunk, "tool_calls", []) or []):
+                if tc.get("name") == "task":
+                    sa_name = (tc.get("args") or {}).get("name", "")
+                    if sa_name and sa_name not in active_subagents:
+                        active_subagents.add(sa_name)
+                        subagent_buffers[sa_name] = ""
+                        yield {"type": "subagent_start", "name": sa_name}
+
+            # ── Route by node ──────────────────────────────────────────────
+            if node in SUBAGENT_NAMES:
+                if node not in active_subagents:
+                    active_subagents.add(node)
+                    subagent_buffers[node] = ""
+                    yield {"type": "subagent_start", "name": node}
+
+                if text:
+                    subagent_buffers[node] = subagent_buffers.get(node, "") + text
+                    yield {"type": "subagent_token", "name": node, "content": text}
+
+                    # Try to extract summary from complete JSON
+                    try:
+                        parsed  = json.loads(subagent_buffers[node])
+                        summary = (
+                            parsed.get("summary")
+                            or parsed.get("analysis_summary")
+                            or parsed.get("run_summary")
+                            or ""
+                        )
+                        if summary:
+                            yield {"type": "subagent_done", "name": node, "summary": summary}
+                            subagent_buffers[node] = ""
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+            elif text:
+                yield {"type": "token", "content": text}
+
+    except Exception as exc:
+        yield {"type": "error", "content": str(exc)}
+
+    # Flush any remaining subagent buffers
+    for sa_name, buf in subagent_buffers.items():
+        if buf:
+            try:
+                parsed  = json.loads(buf)
+                summary = parsed.get("summary") or parsed.get("analysis_summary") or ""
+                yield {"type": "subagent_done", "name": sa_name,
+                       "summary": summary or buf[:300] + ("…" if len(buf) > 300 else "")}
+            except (json.JSONDecodeError, AttributeError):
+                yield {"type": "subagent_done", "name": sa_name,
+                       "summary": buf[:300] + ("…" if len(buf) > 300 else "")}
+
+    yield {"type": "done"}
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 async def _cli():
     import sys, uuid
 
-    brand_id   = "bra_2"
-    brand_name = "bra_3"
+    brand_id   = os.getenv("BRAND_ID", "bra_2")
+    brand_name = os.getenv("BRAND_NAME", "Demo Brand")
 
     if len(sys.argv) >= 3:
         brand_id, brand_name = sys.argv[1], sys.argv[2]
 
     session_id = "cli_session"
-
-    print(f"\n{'═' * 60}")
-    print(f"  FashionOS Supervisor — {brand_name} ({brand_id})")
-    print(f"  Session: {brand_id}:{session_id}")
-    print(f"  Type 'quit' to exit | 'reset' to start new session")
-    print(f"{'═' * 60}\n")
+    print(f"\n{'═'*60}\n  FashionOS — {brand_name} ({brand_id})\n{'═'*60}\n")
 
     while True:
         user_input = input("You: ").strip()
@@ -438,7 +730,6 @@ async def _cli():
             continue
         if not user_input:
             continue
-
         response = await chat(brand_id, brand_name, user_input, thread_id=session_id)
         print(f"\nFashionOS: {response}\n")
 

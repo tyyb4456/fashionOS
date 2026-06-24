@@ -1,17 +1,5 @@
-import os
-from typing import Literal, Annotated, Optional, TypedDict
+from typing import Optional
 from pydantic import BaseModel, Field
-from typing import Literal
-
-from deepagents import create_deep_agent
-
-import operator
-
-from agents.skills import load_skill
-from agents.state import AgentAlert, InventorySnapshot
-
-from dotenv import load_dotenv
-load_dotenv()
 
 
 class SnapshotOut(BaseModel):
@@ -19,7 +7,7 @@ class SnapshotOut(BaseModel):
     sku:                     str
     product_title:           str
     variant_title:           str
-    current_stock:           int  = Field(ge=0)
+    current_stock:           int   = Field(ge=0)
     units_per_day:           float = Field(ge=0.0)
     days_of_stock_remaining: float = Field(
         description=(
