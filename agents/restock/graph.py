@@ -83,6 +83,7 @@ from agents.state import (
     PricingRecommendation,
     RestockRecommendation,
 )
+from response_schemas.restock_model import RestockAnalysis
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -93,98 +94,6 @@ load_dotenv()
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
 
 model = init_chat_model("google_genai:gemini-2.5-flash-lite")
-
-
-# ── Pydantic output schema ─────────────────────────────────────────────────────
-
-class _RestockDecision(BaseModel):
-    """One restock decision per candidate SKU."""
-
-    sku:           str
-    product_title: str
-    variant_title: str
-
-    should_restock: bool = Field(
-        description=(
-            "True if this SKU needs a restock order. "
-            "False if skipping (clearance, dead stock, or not urgent enough)."
-        )
-    )
-    skip_reason: Optional[str] = Field(
-        default=None,
-        description="Why this SKU is being skipped. Only set if should_restock=False.",
-    )
-
-    # Quantity (0 if should_restock=False)
-    recommended_quantity: int = Field(
-        ge=0,
-        description=(
-            "Units to order. Formula: ceil(units_per_day × (lead_time + 7)) - current_stock. "
-            "Minimum 20 units if positive result. Cap at units_per_day × 60. "
-            "0 if should_restock=False."
-        )
-    )
-    urgency:                 str
-    days_of_stock_remaining: float
-    units_per_day:           float
-    current_stock:           int
-
-    # Supplier
-    supplier_type: str = Field(
-        description=(
-            "Inferred from product category: "
-            "'lahore_local' (lead=10d, PK fabric items — kurtas, suits, lawn, co-ords), "
-            "'karachi_trader' (lead=7d, basics/staples — plain fabric, essentials), "
-            "'china_import' (lead=32d incl. customs, accessories/novelty items only). "
-            "Default: 'lahore_local'. NEVER use 'china_import' for critical urgency."
-        )
-    )
-    estimated_lead_days: int = Field(
-        description=(
-            "Lead time for the chosen supplier type. "
-            "lahore_local=10, karachi_trader=7, china_import=32."
-        )
-    )
-    expected_stockout_date: str = Field(
-        description=(
-            "ISO date (YYYY-MM-DD) when stock hits 0 at current velocity. "
-            "Compute: today + days_of_stock_remaining (round to nearest day)."
-        )
-    )
-
-    reason: str = Field(
-        description=(
-            "1-2 sentence explanation including: urgency classification, days remaining, "
-            "velocity, expected stockout date, and supplier rationale. "
-            "Example: 'CRITICAL: 5.0 days of stock at 1.8 units/day — stockout on 2025-06-10. "
-            "Ordering from lahore_local (10-day lead); order must go today to minimise gap.'"
-        )
-    )
-    supplier_message: str = Field(
-        description=(
-            "Ready-to-send WhatsApp message in Urdu-English mix (Pakistani supplier style). "
-            "Include: greeting, brand name, SKU + product description, quantity, urgency, "
-            "required delivery date, request for confirmation and price, closing. "
-            "Keep under 200 words. Write naturally as a Pakistani brand would actually message. "
-            "Example: 'Assalam o alaikum! [Brand] ki taraf se urgent order hai. "
-            "SKU: FOS-001-S (Olive Cargo Pants, Small). Qty: 60 units chahiye. "
-            "Stock almost khatam ho raha hai — delivery by [date] zaroori hai. "
-            "Please availability aur price confirm karein. Shukriya!'"
-        )
-    )
-
-
-class _RestockAnalysis(BaseModel):
-    """Complete structured output for one Restock Agent run."""
-
-    decisions: list[_RestockDecision]
-    summary: str = Field(
-        description=(
-            "2-3 sentence overview. Example: '3 SKUs require restock orders "
-            "(2 critical, 1 high). Total: 180 units across 2 local suppliers. "
-            "1 SKU skipped — Pricing Agent has it on clearance.'"
-        )
-    )
 
 
 # ── Subgraph state ─────────────────────────────────────────────────────────────
@@ -338,7 +247,7 @@ async def run_claude_analysis(state: RestockAgentState) -> dict:
 
     if not candidates:
         print("[Restock] No candidates — skipping analysis.")
-        empty = _RestockAnalysis(
+        empty = RestockAnalysis(
             decisions=[],
             summary="No SKUs require restocking this cycle. All inventory is healthy or managed by pricing.",
         )
@@ -414,8 +323,8 @@ Never omit a candidate from the output.
         "Produce restock decisions with supplier messages for all candidates above."
     )
 
-    structured_llm = model.with_structured_output(_RestockAnalysis)
-    analysis: _RestockAnalysis = await structured_llm.ainvoke([
+    structured_llm = model.with_structured_output(RestockAnalysis)
+    analysis: RestockAnalysis = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_msg),
     ])
@@ -450,7 +359,7 @@ async def execute_restock_actions(state: RestockAgentState) -> dict:
     Critical urgency → "critical" alert. High urgency → "warning" alert.
     Both levels surface in the dashboard and run summary.
     """
-    analysis = _RestockAnalysis.model_validate_json(state["raw_analysis"])
+    analysis = RestockAnalysis.model_validate_json(state["raw_analysis"])
     now_iso  = datetime.now(timezone.utc).isoformat()
 
     restock_recommendations: list[RestockRecommendation] = []

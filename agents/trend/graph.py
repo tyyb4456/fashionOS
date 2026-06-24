@@ -49,6 +49,7 @@ from typing_extensions import TypedDict
 
 from agents.skills import load_skill
 from agents.state import AgentAlert, TrendSignal
+from response_schemas.trend_model import TrendAnalysis, TrendAlertOut, TrendSignalOut
 
 load_dotenv()
 
@@ -68,49 +69,6 @@ else:
     print("[Trend] GOOGLE_CLOUD_PROJECT not set — using google_genai (local dev).")
 
 
-# ── Pydantic output schema (unchanged — write_state_outputs depends on this) ───
-
-class _TrendSignalOut(BaseModel):
-    keyword:   str
-    platform:  str         = Field(description='"tiktok" | "instagram" | "google_trends"')
-    score:     float       = Field(ge=0.0, le=1.0, description="Relative trend strength 0–1.")
-    direction: str         = Field(description='"rising" | "peaking" | "declining"')
-    matched_sku: Optional[str] = Field(
-        default=None,
-        description=(
-            "SKU of the closest matching product in the catalog. "
-            "Match on product_title + variant_title + tags. "
-            "None if confidence < 50%."
-        ),
-    )
-    evidence: str = Field(
-        description=(
-            "1-2 sentences: platform, engagement numbers, SKU match rationale. "
-            "E.g. 'Cargo pants 200k+ views on #PakistaniFashion TikTok — "
-            "FOS-001-S (Olive Cargo Pants, Small) matched on title + tag.'"
-        )
-    )
-    is_new_product_opportunity: bool = Field(
-        default=False,
-        description="True if score > 0.5 AND matched_sku is None.",
-    )
-
-
-class _AlertOut(BaseModel):
-    level:   str           = Field(description='"critical" | "warning" | "info"')
-    message: str
-    sku:     Optional[str] = Field(default=None)
-
-
-class _TrendAnalysis(BaseModel):
-    trend_signals: list[_TrendSignalOut]
-    alerts:        list[_AlertOut]
-    summary: str = Field(
-        description=(
-            "2-3 sentences. Lead with the strongest signal. "
-            "Mention catalog matches and new product opportunities."
-        )
-    )
 
 
 # ── Subgraph state ─────────────────────────────────────────────────────────────
@@ -279,7 +237,7 @@ No alerts for score < 0.5.
         model           = model,
         tools           = all_tools,
         prompt          = system_prompt,
-        response_format = _TrendAnalysis,
+        response_format = TrendAnalysis,
     )
 
     try:
@@ -287,13 +245,13 @@ No alerts for score < 0.5.
             {"messages": [HumanMessage(content=user_message)]},
             config={"recursion_limit": 50},   # ~25 tool-call iterations max
         )
-        analysis: _TrendAnalysis = result["structured_response"]
+        analysis: TrendAnalysis = result["structured_response"]
 
     except Exception as exc:
         print(f"[Trend] ReAct agent error: {exc}")
-        analysis = _TrendAnalysis(
+        analysis = TrendAnalysis(
             trend_signals=[],
-            alerts=[_AlertOut(
+            alerts=[TrendAlertOut(
                 level   = "warning",
                 message = (
                     f"Trend agent failed: {exc}. "
@@ -328,7 +286,7 @@ def write_state_outputs(state: TrendAgentState) -> dict:
     New product opportunity signals get their own "info" alert.
     operator.add semantics → safe merge with other agents' outputs.
     """
-    analysis = _TrendAnalysis.model_validate_json(state["raw_analysis"])
+    analysis = TrendAnalysis.model_validate_json(state["raw_analysis"])
     now_iso  = datetime.now(timezone.utc).isoformat()
 
     trend_signals: list[TrendSignal] = [

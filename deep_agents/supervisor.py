@@ -22,8 +22,8 @@ from dotenv import load_dotenv
 from langgraph.store.redis.aio import AsyncRedisStore 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-# Add this import at the top
-from langgraph.checkpoint.memory import InMemorySaver
+from deep_agents.subagents.trend_agent import build_trend_subagent
+from deep_agents.subagents.pricing_agent import build_pricing_subagent
 
 
 from deep_agents.subagents.inventory_agent import build_inventory_subagent
@@ -32,6 +32,8 @@ from deep_agents.tools.db_tools import get_db_tools
 load_dotenv()
 
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
+SOCIAL_MCP_URL  = os.getenv("SOCIAL_MCP_URL",  "http://localhost:8002/mcp")
+TRENDS_MCP_URL  = os.getenv("TRENDS_MCP_URL",  "http://localhost:8003/mcp")
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 BASE_DIR        = Path(__file__).parent.resolve()
 SKILLS_DIR      = BASE_DIR / "skills"
@@ -158,6 +160,42 @@ DB tools give you latest pipeline results (inventory, alerts, pricing, content).
 - Fresh live analysis   → delegate to subagents
 - Learn something new   → read_file then edit_file on /memories/AGENTS.md
 
+### Subagent call guide
+
+inventory-agent:
+  task("Run full inventory analysis for brand_id={brand_id}")
+  → returns stock levels, velocity, urgency per SKU, dead stock, size anomalies
+
+trend-agent:
+  task(
+      name="trend-agent",
+      task=(
+          "Research trending Pakistani fashion signals for {brand_name}. "
+          "Catalog: {compact_catalog_json}"
+      )
+  )
+  → returns scored trend signals, catalog matches, new product opportunities
+  → build compact_catalog_json from get_inventory_status() results:
+    [{{"sku": s["sku"], "product_title": s["product"], "variant_title": s["variant"]}} 
+     for s in inventory["skus"]]
+  → always call get_inventory_status() first to get the catalog before calling trend-agent
+
+
+pricing-agent:
+  # Always call after inventory-agent and trend-agent so it has full context.
+  task(
+      name="pricing-agent",
+      task=(
+          "Run full pricing analysis for {brand_name} (brand_id={brand_id}). "
+          "inventory_snapshot: {inventory_json} "
+          "trend_signals: {trend_signals_json} "
+          "Fetch prices, decide, execute approved actions, return analysis."
+      )
+  )
+  → auto-executes markdowns, increases, and clearance codes within safe thresholds
+  → returns what ran (executed=True) vs what needs approval (auto_execute=False)
+  → check failed_count in result — any > 0 means Shopify write errors occurred
+
 ## Output format
 ✘ CRITICAL  (action needed today)
 ⚠ WARNING   (action needed this week)
@@ -194,12 +232,20 @@ async def _build_supervisor(brand_id: str, brand_name: str):
     # Seed brand memory into store if first time
     await _ensure_brand_seeded(brand_id, brand_name, store)
 
-    client    = MultiServerMCPClient(
+    shopify_client    = MultiServerMCPClient(
         {"shopify": {"url": SHOPIFY_MCP_URL, "transport": "streamable_http"}}
     )
-    mcp_tools = await client.get_tools()
+    shopify_tools = await shopify_client.get_tools()
+    inventory_subagent = await build_inventory_subagent(shopify_tools)
 
-    inventory_subagent = await build_inventory_subagent(mcp_tools)
+    trend_client = MultiServerMCPClient({
+        "social": {"url": SOCIAL_MCP_URL, "transport": "http"},
+        "trends": {"url": TRENDS_MCP_URL, "transport": "http"},
+    })
+    trend_tools = await trend_client.get_tools()
+    trend_subagent = await build_trend_subagent(trend_tools)
+
+    pricing_subagent = await build_pricing_subagent(shopify_tools)
 
     backend = CompositeBackend(
         default=StateBackend(),
@@ -222,7 +268,7 @@ async def _build_supervisor(brand_id: str, brand_name: str):
         model         = "google_genai:gemini-2.5-flash-lite",
         system_prompt = _build_prompt(brand_id, brand_name),
         tools         = get_db_tools(),
-        subagents     = [inventory_subagent],
+        subagents     = [inventory_subagent, trend_subagent, pricing_subagent],
         backend       = backend,
         store         = store,                    #  the actual persistent store -- Redis store
         memory        = ["/memories/AGENTS.md"],  #  long-term, loaded at startup

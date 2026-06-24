@@ -79,6 +79,7 @@ from agents.state import (
     PricingRecommendation,
     TrendSignal,
 )
+from response_schemas.pricing_model import PricingAnalysis
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -93,102 +94,6 @@ AUTO_EXECUTE_MARKDOWN_CEILING_PCT = float(
 )
 
 model = init_chat_model("google_genai:gemini-2.5-flash-lite")
-
-
-# ── Structured output schema ───────────────────────────────────────────────────
-
-class _PricingDecision(BaseModel):
-    """One pricing decision per variant SKU."""
-
-    sku:           str
-    variant_id:    int
-    product_title: str
-    variant_title: str
-
-    current_price:     float = Field(ge=0)
-    compare_at_price:  float = Field(ge=0, description="0 if SKU is not currently on markdown.")
-    recommended_price: float = Field(ge=0)
-
-    action: str = Field(
-        description=(
-            'One of: "hold" | "markdown" | "increase" | "clearance_code" | "bundle". '
-            '"hold" = no price change. '
-            '"markdown" = reduce price, set compare_at_price to original. '
-            '"increase" = raise price (trending or premium positioning). '
-            '"clearance_code" = deepest markdown + create a discount code for the channel. '
-            '"bundle" = flag for human to create a bundle with another SKU.'
-        )
-    )
-    discount_pct: float = Field(
-        ge=0, le=100,
-        description=(
-            "Discount percentage from current_price for markdown/clearance actions. "
-            "0 for hold and increase actions."
-        )
-    )
-    new_compare_at_price: Optional[float] = Field(
-        default=None,
-        description=(
-            "Value to set as compare_at_price (the 'was' price). "
-            "For first markdown: original current_price. "
-            "For subsequent rungs: keep the original compare_at_price (don't reset it). "
-            "None for hold / increase."
-        )
-    )
-
-    # Markdown ladder state
-    markdown_rung: int = Field(
-        default=0,
-        description=(
-            "Which rung of the markdown ladder this SKU is on AFTER this action. "
-            "0 = full price, 1 = 15% off, 2 = 25% off, 3 = 35-40% off / clearance."
-        )
-    )
-    days_since_last_sale: Optional[float] = Field(
-        default=None,
-        description="Days since the SKU last had any sale. Derived from velocity data."
-    )
-
-    # Execution routing
-    auto_execute: bool = Field(
-        description=(
-            "True = execute this action immediately via Shopify API. "
-            "False = queue for human approval in the dashboard. "
-            "Rule: True ONLY for action='hold' or (action='markdown' AND discount_pct <= 15 "
-            "AND markdown_rung == 0). Everything else is False."
-        )
-    )
-    reason: str = Field(
-        description=(
-            "1-2 sentence explanation. Include: what triggered this, "
-            "the relevant numbers (velocity, days unsold, margin). "
-            "Example: 'SKU FOS-001 has 0 sales in 52 days (dead stock). "
-            "First markdown rung: 15% off sets price from PKR 2999 to PKR 2549.'"
-        )
-    )
-
-    # For clearance_code action only
-    suggested_discount_code: Optional[str] = Field(
-        default=None,
-        description=(
-            "Discount code to create if action is clearance_code. "
-            "Format: CLEAR-{SKU_SLUG}-{YYYYMM}. E.g. CLEAR-FOS001-202501. "
-            "None for other actions."
-        )
-    )
-
-
-class _PricingAnalysis(BaseModel):
-    """Complete structured output for one Pricing Agent run."""
-
-    decisions:   list[_PricingDecision]
-    summary:     str = Field(
-        description=(
-            "2–3 sentence overview. Example: '14 SKUs held at full price (trending or healthy). "
-            "3 first markdowns auto-executed (15% off). "
-            "2 clearance candidates queued for human approval (>45 days dead stock).'"
-        )
-    )
 
 
 # ── Subgraph state ─────────────────────────────────────────────────────────────
@@ -395,7 +300,7 @@ async def run_chat_model_analysis(state: PricingAgentState) -> dict:
             })
 
     if not compact:
-        empty = _PricingAnalysis(
+        empty = PricingAnalysis(
             decisions=[],
             summary="No active SKUs with pricing data found.",
         )
@@ -468,8 +373,8 @@ clearance_code action for any SKU whose title appears in an existing rule:
         "Analyse every SKU and return your complete structured pricing decisions."
     )
 
-    structured_llm = model.with_structured_output(_PricingAnalysis)
-    analysis: _PricingAnalysis = await structured_llm.ainvoke([
+    structured_llm = model.with_structured_output(PricingAnalysis)
+    analysis: PricingAnalysis = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_msg),
     ])
@@ -502,7 +407,7 @@ async def execute_pricing_actions(state: PricingAgentState) -> dict:
     All decisions (executed or pending) are written to state.pricing_recommendations
     so the dashboard can show the full picture.
     """
-    analysis   = _PricingAnalysis.model_validate_json(state["raw_analysis"])
+    analysis   = PricingAnalysis.model_validate_json(state["raw_analysis"])
     now_iso    = datetime.now(timezone.utc).isoformat()
     auto_count = 0
     fail_count = 0
