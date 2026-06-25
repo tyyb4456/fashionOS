@@ -22,12 +22,37 @@ stream_chat() yields SSE-ready dicts:
 
 """
 
+# Official LangGraph fix for custom Pydantic types in checkpoints
+# Format: [(module_path, classname), ...]  — exactly as shown in the warning message
+FASHIONOS_ALLOWED_MSGPACK = [
+    ("response_schemas.inventory_model", "InventoryAnalysis"),
+    ("response_schemas.inventory_model", "SnapshotOut"),
+    ("response_schemas.inventory_model", "AlertOut"),
+    ("response_schemas.trend_model",     "TrendAnalysis"),
+    ("response_schemas.trend_model",     "TrendSignalOut"),
+    ("response_schemas.trend_model",     "TrendAlertOut"),
+    ("response_schemas.pricing_model",   "PricingAnalysis"),
+    ("response_schemas.pricing_model",   "PricingDecisionOut"),
+    ("response_schemas.marketing_model", "MarketingAnalysis"),
+    ("response_schemas.marketing_model", "CampaignDecisionOut"),
+    ("response_schemas.restock_model",   "RestockAnalysis"),
+    ("response_schemas.restock_model",   "RestockDecisionOut"),
+    ("response_schemas.restock_model",   "SupplierBatch"),
+    ("response_schemas.content_model",   "ContentPlan"),
+    ("response_schemas.content_model",   "ContentPostOut"),
+    ("response_schemas.content_model",   "ContentFatigueSkip"),
+    ("response_schemas.content_model",   "InstagramOut"),
+    ("response_schemas.content_model",   "TikTokOut"),
+    ("response_schemas.content_model",   "ShotListItem"),
+]
+
 import os
 import asyncio
 from pathlib import Path
 import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from pydantic import BaseModel as _PydanticBase
 
 from deepagents import FilesystemPermission, create_deep_agent
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend, FilesystemBackend
@@ -37,6 +62,7 @@ from langgraph.store.redis.aio import AsyncRedisStore
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 
+
 from deep_agents.subagents.inventory_agent import build_inventory_subagent
 from deep_agents.subagents.trend_agent import build_trend_subagent
 from deep_agents.subagents.pricing_agent import build_pricing_subagent
@@ -45,6 +71,7 @@ from deep_agents.tools.db_tools import get_db_tools
 from deep_agents.subagents.content_agent import build_content_subagent
 
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from deep_agents.subagents.dm_agent import build_dm_subagent
 
 llm = HuggingFaceEndpoint(
     repo_id="deepseek-ai/DeepSeek-R1-0528",
@@ -97,7 +124,9 @@ _checkpointer: AsyncRedisSaver | None = None
 async def _get_checkpointer() -> AsyncRedisSaver:
     global _checkpointer
     if _checkpointer is None:
-        _checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        serde = JsonPlusSerializer(allowed_msgpack_modules=FASHIONOS_ALLOWED_MSGPACK)
+        _checkpointer = AsyncRedisSaver(redis_url=REDIS_URL, serde=serde)
         await _checkpointer.asetup()
         print("[Checkpointer] ✓ AsyncRedisSaver ready")
     return _checkpointer
@@ -300,6 +329,33 @@ content-agent:
   Build {return_insights_json} from returns-agent result return_insights (or [] if unavailable).
   Always inject current_date as YYYY-MM-DD string.
 
+  dm-agent:
+  # Runs on its own 30-minute schedule — independent of daily pipeline.
+  # Call conversationally when founder asks about DMs, complaints, or bulk orders.
+  # Optional: pass inventory_snapshot for accurate availability answers.
+  # Optional: pass return_insights for product-specific return policy replies.
+  task(
+      name="dm-agent",
+      task=(
+          "Process Instagram DMs for {brand_name} (brand_id={brand_id}). "
+          "inventory_snapshot: {inventory_json} "
+          "return_insights: {return_insights_json} "
+          "Fetch DMs, classify, auto-reply where safe, flag the rest, return DmAnalysis."
+      )
+  )
+  → auto_sends: size_question, availability, order_status, general_inquiry, pricing_inquiry
+  → flags with draft: bulk_inquiry (revenue), complaint (churn), influencer (collab)
+  → batch_stats.action_items: systemic fixes from pattern analysis (e.g. update size guide)
+  → critical_flags: conversation_ids needing IMMEDIATE founder response
+ 
+  # How to build enrichment context:
+  inventory_json      = json.dumps(get_inventory_status(brand_id).get("skus", []))
+  return_insights_json = json.dumps(get_return_insights(brand_id) or [])
+ 
+  # You can also call dm-agent with minimal context:
+  task(name="dm-agent", task="Process Instagram DMs for {brand_name} (brand_id={brand_id}).")
+  # It will default to generic availability replies (reply_confidence=medium).
+
 
 ## Full daily pipeline order
   1. inventory-agent   → inventory_snapshot
@@ -377,6 +433,8 @@ async def _build_supervisor(brand_id: str, brand_name: str):
 
     content_subagent = await build_content_subagent([])
 
+    dm_subagent = await build_dm_subagent(trend_tools)   # social-mcp tools already in here
+
     # ── Backend ────────────────────────────────────────────────────────────────
     backend = CompositeBackend(
         default=StateBackend(),
@@ -403,6 +461,7 @@ async def _build_supervisor(brand_id: str, brand_name: str):
             pricing_subagent,
             marketing_subagent,      
             content_subagent,  
+            dm_subagent,  
         ],
         backend       = backend,
         store         = store,                    #  the actual persistent store -- Redis store
@@ -644,8 +703,20 @@ async def stream_chat(
             msg_chunk, metadata = chunk
             node: str = metadata.get("langgraph_node", "") or ""
 
-            # ── Text content ───────────────────────────────────────────────
+            # # ── Text content ───────────────────────────────────────────────
+            # raw = getattr(msg_chunk, "content", "") or ""
+            # text = (
+            #     "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in raw)
+            #     if isinstance(raw, list) else str(raw)
+            # )
+
             raw = getattr(msg_chunk, "content", "") or ""
+
+            # Subagent structured outputs may arrive as Pydantic model objects.
+            # Convert to JSON string so the buffer can be parsed downstream.
+            if isinstance(raw, _PydanticBase):
+                raw = raw.model_dump_json()
+
             text = (
                 "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in raw)
                 if isinstance(raw, list) else str(raw)
