@@ -22,6 +22,21 @@ stream_chat() yields SSE-ready dicts:
 
 """
 
+from pydantic import BaseModel as _PydanticBase
+
+# Patch 1 — Redis serializer (serialization: writing Pydantic → checkpoint)
+try:
+    from langgraph.checkpoint.redis.jsonplus_redis import JsonPlusRedisSerializer
+    _orig = JsonPlusRedisSerializer._default_handler
+    def _patched(self, obj):
+        if isinstance(obj, _PydanticBase):
+            return obj.model_dump()
+        return _orig(self, obj)
+    JsonPlusRedisSerializer._default_handler = _patched
+    print("[FashionOS] ✓ JsonPlusRedisSerializer patched")
+except Exception as e:
+    print(f"[FashionOS] ⚠ Redis serializer patch failed: {e}")
+
 # Official LangGraph fix for custom Pydantic types in checkpoints
 # Format: [(module_path, classname), ...]  — exactly as shown in the warning message
 FASHIONOS_ALLOWED_MSGPACK = [
@@ -124,13 +139,13 @@ _checkpointer: AsyncRedisSaver | None = None
 async def _get_checkpointer() -> AsyncRedisSaver:
     global _checkpointer
     if _checkpointer is None:
-        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-        serde = JsonPlusSerializer(allowed_msgpack_modules=FASHIONOS_ALLOWED_MSGPACK)
-        _checkpointer = AsyncRedisSaver(redis_url=REDIS_URL, serde=serde)
+        _checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
+        # Patch the allowlist onto the existing internal serde instead of replacing it.
+        # Replacing it breaks AsyncRedisSaver's own serde subclass (_preprocess_interrupts etc.)
+        _checkpointer.serde.allowed_msgpack_modules = FASHIONOS_ALLOWED_MSGPACK
         await _checkpointer.asetup()
         print("[Checkpointer] ✓ AsyncRedisSaver ready")
     return _checkpointer
-
 
 _agent_cache: dict[str, object] = {}
 
@@ -691,6 +706,30 @@ async def stream_chat(
     active_subagents: set[str]  = set()
     subagent_buffers: dict[str, str] = {}
 
+    # Maps tool_call_id → subagent_name so we can intercept ToolMessage results
+    _tc_id_to_agent: dict[str, str] = {}
+    def _flush_subagent_buffer(sa: str) -> dict | None:
+        """Parse buffer, return subagent_done event dict if JSON is complete."""
+        buf = subagent_buffers.get(sa, "")
+        if not buf:
+            return None
+        try:
+            parsed  = json.loads(buf)
+            summary = (
+                parsed.get("summary")
+                or parsed.get("analysis_summary")
+                or parsed.get("run_summary")
+                or ""
+            )
+            if summary:
+                subagent_buffers[sa] = ""
+                return {"type": "subagent_done", "name": sa, "summary": summary, "data": parsed}
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return None
+    def _buffer_subagent_text(sa: str, text: str):
+        subagent_buffers[sa] = subagent_buffers.get(sa, "") + text
+
     try:
         async for chunk in agent.astream(
             {"messages": [{"role": "user", "content": message}]},
@@ -702,13 +741,6 @@ async def stream_chat(
 
             msg_chunk, metadata = chunk
             node: str = metadata.get("langgraph_node", "") or ""
-
-            # # ── Text content ───────────────────────────────────────────────
-            # raw = getattr(msg_chunk, "content", "") or ""
-            # text = (
-            #     "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in raw)
-            #     if isinstance(raw, list) else str(raw)
-            # )
 
             raw = getattr(msg_chunk, "content", "") or ""
 
@@ -725,11 +757,28 @@ async def stream_chat(
             # ── Detect task-tool delegation ────────────────────────────────
             for tc in (getattr(msg_chunk, "tool_calls", []) or []):
                 if tc.get("name") == "task":
-                    sa_name = (tc.get("args") or {}).get("name", "")
-                    if sa_name and sa_name not in active_subagents:
-                        active_subagents.add(sa_name)
-                        subagent_buffers[sa_name] = ""
-                        yield {"type": "subagent_start", "name": sa_name}
+                    args    = tc.get("args") or {}
+                    sa_name = args.get("name") or args.get("subagent_type") or ""
+                    tc_id   = tc.get("id", "")
+                    if sa_name:
+                        if sa_name not in active_subagents:
+                            active_subagents.add(sa_name)
+                            subagent_buffers[sa_name] = ""
+                            yield {"type": "subagent_start", "name": sa_name}
+                        if tc_id:
+                            _tc_id_to_agent[tc_id] = sa_name
+            # ── 2. Intercept ToolMessage results — route to subagent buffer ───────
+            #    ToolMessage has tool_call_id; this is where the raw JSON arrives.
+            tc_id = getattr(msg_chunk, "tool_call_id", None)
+            if tc_id and tc_id in _tc_id_to_agent:
+                sa_name = _tc_id_to_agent[tc_id]
+                if text:
+                    _buffer_subagent_text(sa_name, text)
+                    event = _flush_subagent_buffer(sa_name)
+                    if event:
+                        yield event
+                continue   # never emit tool results as tokens
+            # ── 3. Route by node name (when subagent runs as its own graph node) ──
 
             # ── Route by node ──────────────────────────────────────────────
             if node in SUBAGENT_NAMES:
@@ -739,25 +788,32 @@ async def stream_chat(
                     yield {"type": "subagent_start", "name": node}
 
                 if text:
-                    subagent_buffers[node] = subagent_buffers.get(node, "") + text
-                    yield {"type": "subagent_token", "name": node, "content": text}
+                    _buffer_subagent_text(node, text)
+                    event = _flush_subagent_buffer(node)
+                    if event:
+                        yield event
 
-                    # Try to extract summary from complete JSON
-                    try:
-                        parsed  = json.loads(subagent_buffers[node])
-                        summary = (
-                            parsed.get("summary")
-                            or parsed.get("analysis_summary")
-                            or parsed.get("run_summary")
-                            or ""
-                        )
-                        if summary:
-                            yield {"type": "subagent_done", "name": node, "summary": summary}
-                            subagent_buffers[node] = ""
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
+            # ── 4. Anything else with text → regular supervisor token ─────────────
             elif text:
-                yield {"type": "token", "content": text}
+                # Safety: skip chunks that look like raw JSON tool payloads
+                # that slipped through (starts with { and contains known keys)
+                stripped = text.strip()
+                if stripped.startswith("{") and (
+                    '"inventory_snapshots"' in stripped
+                    or '"trend_signals"'     in stripped
+                    or '"decisions"'         in stripped
+                    or '"posts"'             in stripped
+                ):
+                    # This is an unrouted subagent payload — try to find its owner
+                    # and buffer it, otherwise silently drop it.
+                    for sa, buf in subagent_buffers.items():
+                        _buffer_subagent_text(sa, text)
+                        event = _flush_subagent_buffer(sa)
+                        if event:
+                            yield event
+                            break
+                else:
+                    yield {"type": "token", "content": text}
 
     except Exception as exc:
         yield {"type": "error", "content": str(exc)}
@@ -768,11 +824,19 @@ async def stream_chat(
             try:
                 parsed  = json.loads(buf)
                 summary = parsed.get("summary") or parsed.get("analysis_summary") or ""
-                yield {"type": "subagent_done", "name": sa_name,
-                       "summary": summary or buf[:300] + ("…" if len(buf) > 300 else "")}
+                yield {
+                    "type":    "subagent_done",
+                    "name":    sa_name,
+                    "summary": summary or buf[:300] + ("…" if len(buf) > 300 else ""),
+                    "data":    parsed,
+                }
             except (json.JSONDecodeError, AttributeError):
-                yield {"type": "subagent_done", "name": sa_name,
-                       "summary": buf[:300] + ("…" if len(buf) > 300 else "")}
+                yield {
+                    "type":    "subagent_done",
+                    "name":    sa_name,
+                    "summary": buf[:300] + ("…" if len(buf) > 300 else ""),
+                    "data":    None,
+                }
 
     yield {"type": "done"}
 
