@@ -312,6 +312,40 @@ class ReturnInsightRecord(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# chat_subagent_results  — persists structured subagent output per chat turn
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChatSubagentResult(Base):
+    """
+    One row per subagent fired during a chat stream.
+
+    Keyed by (brand_id, thread_id, turn_index, agent_name).
+    turn_index = 0-based index of the assistant message this belongs to,
+    computed by counting existing AI messages in the checkpoint at stream start.
+
+    data column stores the full structured JSON (InventoryAnalysis, etc.)
+    so the frontend can render rich cards when loading conversation history.
+    """
+    __tablename__ = "chat_subagent_results"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    brand_id:  Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    data:    Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # brands  — tenant registry
 # ══════════════════════════════════════════════════════════════════════════════
 

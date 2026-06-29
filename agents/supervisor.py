@@ -132,6 +132,7 @@ async def run_inventory_agent(state: FashionOSState) -> dict:
         "products":           result.get("products", []),
         "alerts":             result["alerts"],
         "completed_agents":   state.get("completed_agents", []) + ["inventory"],
+        "sales_velocity":     result["sales_velocity"]
     }
 
 

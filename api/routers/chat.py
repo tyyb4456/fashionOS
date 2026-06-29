@@ -27,8 +27,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from api.auth import get_current_brand
 from db.models import Brand
+from db.session import get_session
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 
@@ -52,9 +55,17 @@ class ConversationMeta(BaseModel):
     updated_at: str
 
 
+class SubagentResultOut(BaseModel):
+    name:    str
+    summary: str
+    data:    dict | None = None
+    status:  str = "done"
+
+
 class MessageOut(BaseModel):
-    role:    str   # "user" | "assistant"
-    content: str
+    role:      str   # "user" | "assistant"
+    content:   str
+    subagents: list[SubagentResultOut] = []
 
 
 # ── Non-streaming chat ─────────────────────────────────────────────────────────
@@ -151,16 +162,59 @@ async def list_conversations_endpoint(
 async def get_conversation_messages(
     thread_id: str,
     brand:     Brand = Depends(get_current_brand),
+    session:   AsyncSession = Depends(get_session),
 ) -> list[MessageOut]:
+    from collections import defaultdict
+
+    from sqlalchemy import select
+
+    from db.models import ChatSubagentResult
     from deep_agents.supervisor import get_thread_messages
 
     try:
+        # Load messages from LangGraph checkpoint
         msgs = await get_thread_messages(
             brand_id   = brand.brand_id,
             brand_name = brand.brand_name,
             thread_id  = thread_id,
         )
-        return [MessageOut(**m) for m in msgs]
+
+        # Load persisted subagent results for this thread
+        rows = (await session.execute(
+            select(ChatSubagentResult)
+            .where(ChatSubagentResult.brand_id  == brand.brand_id)
+            .where(ChatSubagentResult.thread_id == thread_id)
+            .order_by(ChatSubagentResult.turn_index, ChatSubagentResult.created_at)
+        )).scalars().all()
+
+        # Group by turn_index (0-based index of assistant messages)
+        subagents_by_turn: dict[int, list[SubagentResultOut]] = defaultdict(list)
+        for row in rows:
+            subagents_by_turn[row.turn_index].append(SubagentResultOut(
+                name    = row.agent_name,
+                summary = row.summary or "",
+                data    = row.data,
+                status  = "done",
+            ))
+
+        # Merge: match each assistant message to its subagent results by position
+        enriched: list[MessageOut] = []
+        asst_idx = 0
+        for m in msgs:
+            if m.get("role") == "assistant":
+                enriched.append(MessageOut(
+                    role      = m["role"],
+                    content   = m.get("content", ""),
+                    subagents = subagents_by_turn.get(asst_idx, []),
+                ))
+                asst_idx += 1
+            else:
+                enriched.append(MessageOut(
+                    role    = m.get("role", "user"),
+                    content = m.get("content", ""),
+                ))
+        return enriched
+
     except Exception as exc:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 

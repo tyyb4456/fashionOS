@@ -688,6 +688,33 @@ async def chat(
     return "No response generated."
 
 
+# ── Subagent result persistence ───────────────────────────────────────────────
+
+async def _save_subagent_result(
+    brand_id:   str,
+    thread_id:  str,
+    turn_index: int,
+    agent_name: str,
+    summary:    str,
+    data:       dict,
+) -> None:
+    """Fire-and-forget: persist one subagent result row to PostgreSQL."""
+    from db.session import AsyncSessionLocal
+    from db.models  import ChatSubagentResult
+    try:
+        async with AsyncSessionLocal() as session:
+            session.add(ChatSubagentResult(
+                brand_id=brand_id,
+                thread_id=thread_id,
+                turn_index=turn_index,
+                agent_name=agent_name,
+                summary=summary,
+                data=data,
+            ))
+            await session.commit()
+    except Exception as exc:
+        print(f"[Supervisor] ⚠ Failed to persist subagent result ({agent_name}): {exc}")
+
 # ── Public chat — streaming ───────────────────────────────────────────────────
 
 async def stream_chat(
@@ -703,13 +730,22 @@ async def stream_chat(
     scoped_thread = f"{brand_id}:{thread_id}"
     config        = {"configurable": {"thread_id": scoped_thread}}
 
+    # Count existing AI messages to determine which turn_index this stream is.
+    # This lets us re-attach subagent cards to the right assistant message later.
+    try:
+        state         = await agent.aget_state(config)
+        existing_msgs = (state.values or {}).get("messages", []) or []
+        turn_index    = sum(1 for m in existing_msgs if getattr(m, "type", "") == "ai")
+    except Exception:
+        turn_index = 0
+
     active_subagents: set[str]  = set()
     subagent_buffers: dict[str, str] = {}
 
     # Maps tool_call_id → subagent_name so we can intercept ToolMessage results
     _tc_id_to_agent: dict[str, str] = {}
-    def _flush_subagent_buffer(sa: str) -> dict | None:
-        """Parse buffer, return subagent_done event dict if JSON is complete."""
+    async def _flush_subagent_buffer(sa: str) -> dict | None:
+        """Parse buffer; if complete JSON with summary, persist to DB and return event."""
         buf = subagent_buffers.get(sa, "")
         if not buf:
             return None
@@ -723,6 +759,11 @@ async def stream_chat(
             )
             if summary:
                 subagent_buffers[sa] = ""
+                # Persist to PostgreSQL (fire-and-forget — never blocks streaming)
+                asyncio.ensure_future(_save_subagent_result(
+                    brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
+                    agent_name=sa, summary=summary, data=parsed,
+                ))
                 return {"type": "subagent_done", "name": sa, "summary": summary, "data": parsed}
         except (json.JSONDecodeError, AttributeError):
             pass
@@ -774,7 +815,7 @@ async def stream_chat(
                 sa_name = _tc_id_to_agent[tc_id]
                 if text:
                     _buffer_subagent_text(sa_name, text)
-                    event = _flush_subagent_buffer(sa_name)
+                    event = await _flush_subagent_buffer(sa_name)
                     if event:
                         yield event
                 continue   # never emit tool results as tokens
@@ -789,14 +830,13 @@ async def stream_chat(
 
                 if text:
                     _buffer_subagent_text(node, text)
-                    event = _flush_subagent_buffer(node)
+                    event = await _flush_subagent_buffer(node)
                     if event:
                         yield event
 
             # ── 4. Anything else with text → regular supervisor token ─────────────
             elif text:
-                # Safety: skip chunks that look like raw JSON tool payloads
-                # that slipped through (starts with { and contains known keys)
+
                 stripped = text.strip()
                 if stripped.startswith("{") and (
                     '"inventory_snapshots"' in stripped
@@ -804,11 +844,10 @@ async def stream_chat(
                     or '"decisions"'         in stripped
                     or '"posts"'             in stripped
                 ):
-                    # This is an unrouted subagent payload — try to find its owner
-                    # and buffer it, otherwise silently drop it.
-                    for sa, buf in subagent_buffers.items():
+              
+                    for sa in list(subagent_buffers):
                         _buffer_subagent_text(sa, text)
-                        event = _flush_subagent_buffer(sa)
+                        event = await _flush_subagent_buffer(sa)
                         if event:
                             yield event
                             break
@@ -818,12 +857,16 @@ async def stream_chat(
     except Exception as exc:
         yield {"type": "error", "content": str(exc)}
 
-    # Flush any remaining subagent buffers
+    # Flush any remaining subagent buffers and persist to DB
     for sa_name, buf in subagent_buffers.items():
         if buf:
             try:
                 parsed  = json.loads(buf)
                 summary = parsed.get("summary") or parsed.get("analysis_summary") or ""
+                asyncio.ensure_future(_save_subagent_result(
+                    brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
+                    agent_name=sa_name, summary=summary or "", data=parsed,
+                ))
                 yield {
                     "type":    "subagent_done",
                     "name":    sa_name,
