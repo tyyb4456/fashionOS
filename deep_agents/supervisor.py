@@ -190,27 +190,6 @@ Examples:
 """
 
 
-# async def _ensure_brand_seeded(brand_id: str, brand_name: str, store: AsyncRedisStore) -> None:
-#     namespace = (brand_id,)
-#     key       = "/AGENTS.md"
-
-#     existing   = await store.aget(namespace, key)
-#     needs_seed = existing is None
-
-#     if not needs_seed and existing:
-#         file_data = existing.value or {}
-#         content   = file_data.get("content", "")
-#         if isinstance(content, list):
-#             content = "\n".join(content)
-#         if "brand_id  :" in content or "brand_name:" in content:
-#             needs_seed = True
-#             print(f"[Memory] ↺ Re-seeding AGENTS.md for brand={brand_id} (stale format)")
-
-#     if needs_seed:
-#         await store.aput(namespace, key, create_file_data(_seed_agents_md(brand_id, brand_name)))
-        # print(f"[Memory] ✓ Seeded AGENTS.md for brand={brand_id}")
-
-
 async def _ensure_brand_seeded(brand_id: str, brand_name: str, store: AsyncRedisStore) -> None:
     namespace = (brand_id,)
     key       = "/AGENTS.md"
@@ -411,6 +390,7 @@ def _build_prompt(brand_id: str, brand_name: str) -> str:
     )
     return header + _PROMPT_BASE.replace("BRAND_ID", f'"{brand_id}"')
 
+from deep_agents.load_model import llm
 
 # ── Supervisor factory ─────────────────────────────────────────────────────────
 
@@ -466,7 +446,7 @@ async def _build_supervisor(brand_id: str, brand_name: str):
 
     agent = create_deep_agent(
         name          = f"fashionos-{brand_id}",
-        model         = "google_genai:gemini-2.5-flash-lite",
+        model         = llm,
         # model         = chat_model,
         system_prompt = _build_prompt(brand_id, brand_name),
         tools         = get_db_tools(),
