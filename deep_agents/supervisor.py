@@ -704,14 +704,20 @@ async def stream_chat(
     thread_id:  str = "default",
 ) -> AsyncGenerator[dict, None]:
     """
-    Yields SSE-ready event dicts. See module docstring for event types.
+    Yields SSE-ready event dicts:
+      {"type": "token",          "content": "..."}
+      {"type": "reasoning",      "name": None|"<subagent>", "content": "..."}
+      {"type": "tool_call",      "name": "...", "id": "...", "args": {...}}
+      {"type": "tool_result",    "name": "...", "id": "...", "data": ...}
+      {"type": "subagent_start", "name": "..."}
+      {"type": "subagent_done",  "name": "...", "summary": "...", "data": {...}}
+      {"type": "done"}
+      {"type": "error",          "content": "..."}
     """
     agent         = await _get_cached_agent(brand_id, brand_name)
     scoped_thread = f"{brand_id}:{thread_id}"
     config        = {"configurable": {"thread_id": scoped_thread}}
 
-    # Count existing AI messages to determine which turn_index this stream is.
-    # This lets us re-attach subagent cards to the right assistant message later.
     try:
         state         = await agent.aget_state(config)
         existing_msgs = (state.values or {}).get("messages", []) or []
@@ -719,13 +725,15 @@ async def stream_chat(
     except Exception:
         turn_index = 0
 
-    active_subagents: set[str]  = set()
+    active_subagents: set[str]       = set()
     subagent_buffers: dict[str, str] = {}
 
-    # Maps tool_call_id → subagent_name so we can intercept ToolMessage results
+    # Maps tool_call_id → subagent_name (delegation via the "task" tool)
     _tc_id_to_agent: dict[str, str] = {}
+    # Maps tool_call_id → tool_name for DIRECT tool calls (DB tools, read_file, edit_file...)
+    _tc_id_to_tool: dict[str, str] = {}
+
     async def _flush_subagent_buffer(sa: str) -> dict | None:
-        """Parse buffer; if complete JSON with summary, persist to DB and return event."""
         buf = subagent_buffers.get(sa, "")
         if not buf:
             return None
@@ -739,7 +747,6 @@ async def stream_chat(
             )
             if summary:
                 subagent_buffers[sa] = ""
-                # Persist to PostgreSQL (fire-and-forget — never blocks streaming)
                 asyncio.ensure_future(_save_subagent_result(
                     brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
                     agent_name=sa, summary=summary, data=parsed,
@@ -748,6 +755,7 @@ async def stream_chat(
         except (json.JSONDecodeError, AttributeError):
             pass
         return None
+
     def _buffer_subagent_text(sa: str, text: str):
         subagent_buffers[sa] = subagent_buffers.get(sa, "") + text
 
@@ -764,23 +772,52 @@ async def stream_chat(
             node: str = metadata.get("langgraph_node", "") or ""
 
             raw = getattr(msg_chunk, "content", "") or ""
-
-            # Subagent structured outputs may arrive as Pydantic model objects.
-            # Convert to JSON string so the buffer can be parsed downstream.
             if isinstance(raw, _PydanticBase):
                 raw = raw.model_dump_json()
 
-            text = (
-                "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in raw)
-                if isinstance(raw, list) else str(raw)
-            )
+            # ── Split content blocks: reasoning vs. text ────────────────────────
+            # Kimi-K2.6 (AzureAIOpenAIApiChatModel) returns a list of blocks:
+            #   {"type": "reasoning", "summary": [{"text": "..."}]}
+            #   {"type": "text", "text": "..."}
+            # Other providers just return a plain string — handled below.
+            if isinstance(raw, list):
+                reasoning_parts, text_parts = [], []
+                for c in raw:
+                    if isinstance(c, dict):
+                        block_type = c.get("type")
+                        if block_type == "reasoning":
+                            for s in c.get("summary", []) or []:
+                                reasoning_parts.append(s.get("text", "") if isinstance(s, dict) else str(s))
+                            if c.get("text"):
+                                reasoning_parts.append(c["text"])
+                        elif block_type == "text":
+                            text_parts.append(c.get("text", ""))
+                        elif "text" in c:
+                            text_parts.append(c.get("text", ""))
+                    else:
+                        text_parts.append(str(c))
+                reasoning_text = "".join(reasoning_parts)
+                text           = "".join(text_parts)
+            else:
+                reasoning_text = ""
+                text            = str(raw)
 
-            # ── Detect task-tool delegation ────────────────────────────────
+            # ── Reasoning → its own event, hidden by default on the frontend ────
+            if reasoning_text:
+                yield {
+                    "type":    "reasoning",
+                    "name":    node if node in SUBAGENT_NAMES else None,
+                    "content": reasoning_text,
+                }
+
+            # ── Detect tool-call requests on this chunk ──────────────────────────
             for tc in (getattr(msg_chunk, "tool_calls", []) or []):
-                if tc.get("name") == "task":
+                tc_name = tc.get("name")
+                tc_id   = tc.get("id", "")
+
+                if tc_name == "task":
                     args    = tc.get("args") or {}
                     sa_name = args.get("name") or args.get("subagent_type") or ""
-                    tc_id   = tc.get("id", "")
                     if sa_name:
                         if sa_name not in active_subagents:
                             active_subagents.add(sa_name)
@@ -788,9 +825,20 @@ async def stream_chat(
                             yield {"type": "subagent_start", "name": sa_name}
                         if tc_id:
                             _tc_id_to_agent[tc_id] = sa_name
-            # ── 2. Intercept ToolMessage results — route to subagent buffer ───────
-            #    ToolMessage has tool_call_id; this is where the raw JSON arrives.
+
+                elif tc_name and tc_id:
+                    # Direct tool call — DB tools (get_inventory_status etc.), read_file, edit_file
+                    _tc_id_to_tool[tc_id] = tc_name
+                    yield {
+                        "type": "tool_call",
+                        "name": tc_name,
+                        "id":   tc_id,
+                        "args": tc.get("args") or {},
+                    }
+
+            # ── Intercept ToolMessage results ────────────────────────────────────
             tc_id = getattr(msg_chunk, "tool_call_id", None)
+
             if tc_id and tc_id in _tc_id_to_agent:
                 sa_name = _tc_id_to_agent[tc_id]
                 if text:
@@ -798,10 +846,20 @@ async def stream_chat(
                     event = await _flush_subagent_buffer(sa_name)
                     if event:
                         yield event
-                continue   # never emit tool results as tokens
-            # ── 3. Route by node name (when subagent runs as its own graph node) ──
+                continue   # never emit subagent tool results as tokens
 
-            # ── Route by node ──────────────────────────────────────────────
+            if tc_id and tc_id in _tc_id_to_tool:
+                tool_name = _tc_id_to_tool.pop(tc_id)
+                parsed: object = text
+                if text:
+                    try:
+                        parsed = json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                yield {"type": "tool_result", "name": tool_name, "id": tc_id, "data": parsed}
+                continue   # never emit raw DB tool JSON as tokens
+
+            # ── Route by node (subagent running as its own graph node) ──────────
             if node in SUBAGENT_NAMES:
                 if node not in active_subagents:
                     active_subagents.add(node)
@@ -814,9 +872,8 @@ async def stream_chat(
                     if event:
                         yield event
 
-            # ── 4. Anything else with text → regular supervisor token ─────────────
+            # ── Anything else with text → regular supervisor token ──────────────
             elif text:
-
                 stripped = text.strip()
                 if stripped.startswith("{") and (
                     '"inventory_snapshots"' in stripped
@@ -824,7 +881,6 @@ async def stream_chat(
                     or '"decisions"'         in stripped
                     or '"posts"'             in stripped
                 ):
-              
                     for sa in list(subagent_buffers):
                         _buffer_subagent_text(sa, text)
                         event = await _flush_subagent_buffer(sa)
