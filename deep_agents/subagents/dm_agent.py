@@ -42,6 +42,9 @@ Trust boundary:
 
 from response_schemas.dm_model import DmAnalysis
 
+from langchain.chat_models import init_chat_model
+model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
 
@@ -553,5 +556,6 @@ async def build_dm_subagent(tools: list) -> dict:
         ),
         "system_prompt":   DM_AGENT_PROMPT,
         "tools":           filtered_tools,
+        "model":           model,
         "response_format": DmAnalysis,
     }

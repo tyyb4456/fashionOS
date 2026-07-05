@@ -20,7 +20,8 @@ RUN apt-get update \
 
 # Python deps first — this layer is cached unless requirements.txt changes
 COPY requirements.txt .
-RUN pip install \
+RUN pip install --upgrade pip && \
+    pip install \
     --default-timeout=300 \
     -r requirements.txt
 

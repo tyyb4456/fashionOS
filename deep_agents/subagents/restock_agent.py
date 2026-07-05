@@ -31,7 +31,8 @@ Smarter vs the graph version:
 """
 
 from response_schemas.restock_model import RestockAnalysis
-
+from langchain.chat_models import init_chat_model
+model = init_chat_model("google_genai:gemini-2.5-flash-lite")
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
 
@@ -314,5 +315,6 @@ async def build_restock_subagent(tools: list) -> dict:
         ),
         "system_prompt":   RESTOCK_AGENT_PROMPT,
         "tools":           filtered_tools,
+        "model":           model,
         "response_format": RestockAnalysis,
     }

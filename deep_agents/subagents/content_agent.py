@@ -38,6 +38,10 @@ Autonomy upgrades vs graph version:
 from response_schemas.content_model import ContentPlan
 
 
+from langchain.chat_models import init_chat_model
+model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+
+
 # ── System Prompt ──────────────────────────────────────────────────────────────
 
 CONTENT_AGENT_PROMPT = """
@@ -565,5 +569,6 @@ async def build_content_subagent(tools: list) -> dict:
         ),
         "system_prompt":   CONTENT_AGENT_PROMPT,
         "tools":           [],
+        "model":           model,
         "response_format": ContentPlan,
     }

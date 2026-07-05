@@ -1,5 +1,7 @@
-langgraph
-langchain 
+langgraph==1.2.7
+langchain==1.3.11
+langchain-azure-ai==1.2.3
+deepagents
 langchain-mcp-adapters
 langchain[google-genai]
 fastmcp
@@ -29,17 +31,5 @@ cryptography
 clerk-backend-api
 svix
 
-langchain-groq 
 
-# huggingface and related libraries
-
-# langchain-huggingface 
-# text-generation 
-# transformers 
-# google-search-results 
-# numexpr 
-# langchainhub 
-# sentencepiece 
-# jinja2 
-# bitsandbytes 
-# accelerate
+langgraph-checkpoint-redis

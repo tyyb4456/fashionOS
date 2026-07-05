@@ -20,6 +20,9 @@ System prompt design:
 
 from response_schemas.inventory_model import InventoryAnalysis
 
+from langchain.chat_models import init_chat_model
+model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
 # Embedded directly — subagents don't auto-load skills or memory from the parent.
@@ -216,4 +219,5 @@ async def build_inventory_subagent(tools: list) -> dict:
         "system_prompt":   INVENTORY_AGENT_PROMPT,
         "tools":           tools,
         "response_format": InventoryAnalysis,
+        "model":           model,
     }
