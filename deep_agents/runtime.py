@@ -46,8 +46,10 @@ _store: AsyncRedisStore | None = None
 async def get_store() -> AsyncRedisStore:
     global _store
     if _store is None:
-        _store = AsyncRedisStore(redis_url=REDIS_URL)
-        await _store.setup()
+        candidate = AsyncRedisStore(redis_url=REDIS_URL)
+        await candidate.setup()     # if this throws, _store stays None — next request retries clean
+        _store = candidate
+        print("[Store] ✓ AsyncRedisStore ready (index created)")
     return _store
 
 
