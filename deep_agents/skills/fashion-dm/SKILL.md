@@ -69,18 +69,20 @@ else:
     return_insights_clean = []
 ```
 
-### Step 3 — Delegate to dm-agent
+### Step 3 — Confirm before queuing, then queue (async)
 
-```
-task(
-    name="dm-agent",
-    task=(
-        "Process Instagram DMs for {brand_name} (brand_id={brand_id}). "
-        "inventory_snapshot: {inventory_json} "
-        "return_insights: {return_insights_json} "
-        "Fetch DMs, classify, auto-reply where safe, flag the rest, return DmAnalysis."
-    )
-)
+DM can auto-send real Instagram replies to real customers the moment the run
+lands (size/availability/order-status/general/pricing categories). Tell the
+founder plainly that customer replies may go out automatically and get an
+explicit yes before queuing — UNLESS this is the routine 30-minute scheduled
+sweep, which already runs on its own via Celery beat and never touches chat.
+
+start_agent_analysis(brand_id=<brand_id>, brand_name=<brand_name>, agents=["dm"])
+
+No dependencies — queues immediately. Returns a task_id instantly. Acknowledge
+DM processing has started (~10-20s), then check_agent_analysis_status(task_id)
+on a later turn. Once "done", report from result.dm (auto_replied, flagged) and
+get_open_alerts() / batch pattern insights for what was flagged.
 ```
 
 ### Step 4 — Interpret DmAnalysis output

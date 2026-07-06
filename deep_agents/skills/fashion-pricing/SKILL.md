@@ -24,19 +24,26 @@ The founder's time is spent only on large discounts, bundle strategy, and aggres
 
 ## When to Run Pricing
 
-Trigger the pricing-agent subagent when:
-- Founder asks "what are the current prices?", "what's pending approval?", "review pricing"
-- A daily pipeline run needs the full pricing sweep
-- Inventory agent has flagged dead stock (zero velocity) SKUs that need markdown decisions
-- Trend agent has returned rising signals — trending SKUs may need price increase
-- Founder approves a pending pricing action in the dashboard (confirm it's been applied)
+Check get_pending_approvals() / get_inventory_status() first — if a recent run
+already covers the question, answer from that. Queue a fresh run only when:
+- Founder asks about current prices / pending approvals AND the last run is stale
+- Inventory has flagged dead stock (zero velocity) needing markdown decisions
+- Trend has rising signals — trending SKUs may need a price increase
+- Founder approved a pending action in the dashboard (confirm it applied)
 
-**Execution order matters.** Always run in this sequence:
-  1. `inventory-agent` — produces inventory_snapshot with velocity and urgency
-  2. `trend-agent`     — produces trend_signals with matched_sku
-  3. `pricing-agent`   — receives both as context, makes smarter decisions
+**⚠ Confirm before queuing.** Pricing can auto-execute real Shopify price changes
+(first-rung markdowns, trending increases, clearance codes within threshold — see
+Auto-Execute Rules below). Tell the founder plainly what could auto-apply and get
+an explicit yes before calling start_agent_analysis with "pricing".
 
-Pricing agent can run standalone if context is unavailable, but quality is lower.
+start_agent_analysis(brand_id=<brand_id>, brand_name=<brand_name>, agents=["pricing"])
+
+Auto-includes inventory and trend first (mandatory order — pricing needs
+velocity/urgency and trend signals as context). Returns a task_id instantly.
+Acknowledge that pricing review has started (~20-40s for the 3-agent chain), then
+check_agent_analysis_status(task_id) on a later turn. Once "done", report from
+result.pricing (total_decisions, auto_executed, pending_approval) and
+get_pending_approvals()["pricing"] for line-item detail.
 
 ---
 

@@ -17,7 +17,7 @@ Graph topology  (4 nodes, fully sequential):
       │                               Pure Python — no I/O.
       │                               Writes: state.skill_content
       ▼
-  run_claude_analysis      ← Node 3: Structured LLM call (with_structured_output).
+  run_chat_model_analysis      ← Node 3: Structured LLM call (with_structured_output).
       │                               Input: compact inventory payload + skill prompt.
       │                               Writes: state.raw_analysis (Pydantic JSON)
       ▼
@@ -63,26 +63,9 @@ load_dotenv()
 
 from response_schemas.inventory_model import InventoryAnalysis, SnapshotOut, AlertOut
 
-
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
-
-
-# llm = HuggingFaceEndpoint(
-#     repo_id="deepseek-ai/DeepSeek-R1-0528",
-#     task="text-generation",
-#     max_new_tokens=4096,      # 512 would cut off mid-JSON
-#     do_sample=False,
-#     repetition_penalty=1.03,
-#     provider="auto",
-#     timeout=600,              # 10 minutes
-# )
-
-# chat_model = ChatHuggingFace(llm=llm)
-
-
-
 model = init_chat_model("google_genai:gemini-2.5-flash-lite")
 
 
@@ -210,7 +193,7 @@ def load_domain_skill(state: InventoryAgentState) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — run_claude_analysis
+# NODE 3 — run_chat_model_analysis
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def run_chat_model_analysis(state: InventoryAgentState) -> dict:
@@ -222,11 +205,11 @@ async def run_chat_model_analysis(state: InventoryAgentState) -> dict:
       A single structured call is faster, cheaper, and sufficient here.
       (ReAct pattern is reserved for agents needing dynamic multi-step tool use,
        e.g. Trend Agent scraping multiple sources, Restock Agent drafting orders.)
-    - llm.with_structured_output(_InventoryAnalysis) forces Claude to respond
+    - llm.with_structured_output(_InventoryAnalysis) forces the chat model to respond
       via tool_use blocks. LangChain validates + parses into the Pydantic model.
       No free-text JSON parsing. No regex. No hallucinated schema drift.
     - We build a compact inventory payload (pre-computed days_estimated) to
-      reduce token usage and give Claude clean data to reason over.
+      reduce token usage and give the chat model clean data to reason over.
     """
     # ── Build velocity lookup for O(1) joins ──────────────────────────────────
     velocity_by_sku: dict[str, float] = {
@@ -249,7 +232,7 @@ async def run_chat_model_analysis(state: InventoryAgentState) -> dict:
             stock    = variant.get("inventory_quantity", 0)
             velocity = velocity_by_sku.get(sku, 0.0)
 
-            # Pre-compute to help Claude verify — it can override if logic differs
+            # Pre-compute to help the chat model verify — it can override if logic differs
             days_estimated = round(stock / velocity, 1) if velocity > 0 else 999.0
 
             compact.append({
@@ -259,7 +242,7 @@ async def run_chat_model_analysis(state: InventoryAgentState) -> dict:
                 "current_stock":  stock,
                 "units_per_day":  velocity,
                 "days_estimated": days_estimated,
-                # Flag zero-velocity for Claude to notice
+                # Flag zero-velocity for the chat model to notice
                 "zero_velocity":  velocity == 0.0 and stock > 0,
             })
 
@@ -311,24 +294,7 @@ Rules:
     # ── Structured LLM call ───────────────────────────────────────────────────
     import re
 
-    structured_llm = model.with_structured_output(
-        InventoryAnalysis,
-        # method="json_schema",
-        # include_raw=True,         # get raw response so we can inspect it
-    )
-
-    # raw_result = await structured_llm.ainvoke([
-    #     SystemMessage(content=system_prompt),
-    #     HumanMessage(content=user_message),
-    # ])
-
-    # # strip <think>...</think> then re-parse if parsing failed
-    # if raw_result.get("parsing_error"):
-    #     raw_text = raw_result["raw"].content
-    #     clean = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
-    #     analysis = _InventoryAnalysis.model_validate_json(clean)
-    # else:
-    #     analysis = raw_result["parsed"]
+    structured_llm = model.with_structured_output(InventoryAnalysis)
 
     analysis: InventoryAnalysis = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),

@@ -77,22 +77,20 @@ If prior results aren't available: call `get_inventory_status()` as fallback for
 `get_pending_approvals()["pricing"]` for pricing context. Trend signals may be absent —
 content agent will fall back to markdown + campaign-sync candidates only.
 
-### Step 3 — Delegate to content-agent
+### Step 3 — Confirm before queuing, then queue (async)
 
-```
-task(
-    name="content-agent",
-    task=(
-        "Generate content plan for {brand_name} (brand_id={brand_id}). "
-        "current_date: {YYYY-MM-DD} "
-        "inventory_snapshot: {inventory_json} "
-        "trend_signals: {trend_signals_json} "
-        "pricing_recommendations: {pricing_json} "
-        "marketing_actions: {marketing_json} "
-        "return_insights: {return_insights_json} "
-        "Select candidates, generate Instagram + TikTok content, return ContentPlan."
-    )
-)
+Content itself has no side effects, but it auto-includes marketing as a
+dependency, and marketing CAN auto-execute real Meta changes. Tell the founder
+marketing decisions may auto-apply as part of this run and get an explicit yes —
+same rule as running marketing directly.
+
+start_agent_analysis(brand_id=<brand_id>, brand_name=<brand_name>, agents=["content"])
+
+Auto-includes inventory, trend, pricing, marketing (mandatory — content needs
+clearance flags and campaign status to avoid contradictory signals). Returns a
+task_id instantly. Acknowledge content planning has started (~60-90s for the
+5-agent chain), then check_agent_analysis_status(task_id) on a later turn. Once
+"done", pull the plan via get_content_queue().
 ```
 
 ### Step 4 — Interpret ContentPlan output

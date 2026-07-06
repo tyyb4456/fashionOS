@@ -59,35 +59,27 @@ catch the clearance contradiction (never restock or run ads on something being c
 
 ### Step 1 — Check if fresh data exists
 
-Call `get_pending_approvals()` to check if marketing decisions from a recent run
-already exist. If `marketing` list is non-empty and run was less than 6 hours ago,
-present existing data rather than re-running the subagent.
+Call get_pending_approvals() first. If marketing is non-empty and the last run
+was under 6 hours ago, present existing data rather than queuing a new run.
 
-### Step 2 — Gather context for subagent
+### Step 2 — Confirm before queuing (MANDATORY)
 
-Collect from prior agents in this session:
-- `inventory_snapshot` from inventory-agent result → provides stock + urgency per SKU
-- `trend_signals` from trend-agent result → provides scored trend matches per SKU
-- `pricing_recommendations` from pricing-agent result → provides clearance flags
+Marketing can auto-execute real Meta changes the moment the run lands — pausing
+out-of-stock/clearance campaigns, decreasing budget on low ROAS or organic viral
+SKUs. Tell the founder plainly what could auto-apply and get an explicit yes
+before proceeding to Step 3.
 
-If prior agent results aren't available:
-  Call `get_inventory_status()` and `get_pending_approvals()["pricing"]` as fallback.
-  Trend signals may be absent — subagent will apply ROAS-only logic.
+### Step 3 — Queue the marketing agent (async)
 
-### Step 3 — Delegate to marketing-agent
+start_agent_analysis(brand_id=<brand_id>, brand_name=<brand_name>, agents=["marketing"])
 
-```
-task(
-    name="marketing-agent",
-    task=(
-        "Run Meta ad campaign analysis for {brand_name} (brand_id={brand_id}). "
-        "inventory_snapshot: {inventory_json} "
-        "trend_signals: {trend_signals_json} "
-        "pricing_recommendations: {pricing_json} "
-        "Fetch campaign data, make decisions, execute approved actions, return analysis."
-    )
-)
-```
+Auto-includes inventory, trend, pricing first (mandatory — marketing needs stock
+levels, trend scores, and clearance flags). Returns a task_id instantly.
+Acknowledge the ad review has started (~40-60s for the 4-agent chain), then
+check_agent_analysis_status(task_id) on a later turn. Once "done", report from
+result.marketing (total_decisions, auto_executed, pending_approval) and
+get_pending_approvals()["marketing"] for detail.
+
 
 ### Step 4 — Interpret MarketingAnalysis output
 

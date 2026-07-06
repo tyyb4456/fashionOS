@@ -55,25 +55,23 @@ Pass this as JSON in the task message so the subagent can match SKUs.
 
 ---
 
-### Step 2 — Delegate to trend-agent subagent
+### Step 2 — Queue the trend agent (async)
 
-```
-task(
-    name="trend-agent",
-    task=(
-        "Research trending Pakistani fashion signals for [brand_name]. "
-        "Catalog: [catalog JSON]"
-    )
-)
-```
+start_agent_analysis(brand_id=<brand_id>, brand_name=<brand_name>, agents=["trend"])
 
-The subagent autonomously:
+Returns a task_id almost instantly — runs agents/trend/graph.py's ReAct loop in
+the background (auto-includes inventory first, since trend needs the catalog).
+Tell the founder trend research has started (~15-30s), then check back with
+check_agent_analysis_status(task_id) — once "done", result.run_summary and
+get_open_alerts() / get_inventory_status() reflect the fresh signals.
+
+The pipeline node autonomously:
 1. Chooses Pakistani fashion hashtags appropriate for the catalog
 2. Searches TikTok and Instagram, evaluating signal quality per result
 3. Retries with different hashtags if results are thin (< 5 posts or near-zero engagement)
 4. Cross-references strong social signals on Google Trends (Pakistan, geo=PK)
 5. Scores and ranks all signals
-6. Returns a structured `TrendAnalysis`
+6. Writes trend_signals + alerts to the database
 
 ---
 

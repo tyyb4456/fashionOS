@@ -19,7 +19,7 @@ Graph topology  (4 nodes, sequential):
   load_domain_skill        ← Node 2: load_skill("fashion_pricing")
       │
       ▼
-  run_claude_analysis      ← Node 3: Structured LLM call.
+  run_chat_model_analysis      ← Node 3: Structured LLM call.
       │                               Produces PricingDecision list with
       │                               auto_execute flag per recommendation.
       ▼
@@ -226,7 +226,7 @@ def load_domain_skill(state: PricingAgentState) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — run_claude_analysis
+# NODE 3 — run_chat_model_analysis
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def run_chat_model_analysis(state: PricingAgentState) -> dict:

@@ -49,23 +49,16 @@ Call `get_inventory_status()` to confirm the latest snapshot exists.
 Call `get_pending_approvals()` to see if restock recommendations already exist
 from a previous run — no need to re-run the subagent if fresh data is available.
 
-### Step 2 — Delegate to restock-agent
+### Step 2 — Queue the restock agent (async)
 
-```
-task(
-    name="restock-agent",
-    task=(
-        "Run restock analysis for [brand_name] (brand_id=[id]). "
-        "today: [YYYY-MM-DD] "
-        "inventory_snapshot: [inventory_json] "
-        "pricing_recommendations: [pricing_json] "
-        "Analyse, create recommendations, return analysis."
-    )
-)
-```
+start_agent_analysis(brand_id=<brand_id>, brand_name=<brand_name>, agents=["restock"])
 
-Build inventory_json from `get_inventory_status()["skus"]`.
-Build pricing_json from `get_pending_approvals()["pricing"]` or the pricing-agent output.
+Auto-includes inventory and pricing first (mandatory — restock needs the
+clearance skip rule). No side effects — restock only ever writes pending_approval
+rows, queue freely, no confirmation needed. Returns a task_id instantly;
+acknowledge ("checking restock needs now, ~30-40s"), then
+check_agent_analysis_status(task_id) on a later turn. Once "done", pull detail
+via get_pending_approvals()["restock"].
 
 ### Step 3 — Interpret RestockAnalysis output
 

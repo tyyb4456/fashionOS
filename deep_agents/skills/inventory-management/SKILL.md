@@ -11,6 +11,12 @@ description: >-
 
 # Inventory Management Skill
 
+> **Note:** The step-by-step procedure below (fetching Shopify data, computing
+> velocity, classifying urgency) runs automatically inside the LangGraph pipeline
+> node (agents/inventory/graph.py) once queued — you do not execute these steps
+> yourself. Use this skill to know WHEN/HOW to queue inventory analysis and HOW
+> TO INTERPRET the thresholds/alerts it produces, for explaining results to the founder.
+
 ## Overview
 This skill guides a complete inventory health analysis for a Shopify fashion brand.
 It fetches live data via MCP tools, computes velocity and days-of-stock, classifies
@@ -20,20 +26,18 @@ each SKU by urgency, and produces structured output ready for the dashboard.
 
 ## Step-by-Step Workflow
 
-### Step 1 — Fetch Shopify Data
+### Step 1 — Queue the inventory agent (async)
 
-Call both tools in parallel (or sequentially if parallel is unavailable):
+start_agent_analysis(brand_id=<brand_id>, brand_name=<brand_name>, agents=["inventory"])
 
-```
-list_products(brand_id=<brand_id>, limit=250, status="active")
-calculate_sales_velocity(brand_id=<brand_id>, days=14)
-```
+No dependencies, no side effects, no confirmation needed — queue freely. Returns
+a task_id instantly. Acknowledge the stock check has started (~10-20s), then
+check_agent_analysis_status(task_id) on a later turn. Once "done", pull the full
+snapshot via get_inventory_status() or urgent-only via get_critical_skus().
 
-**Critical filter:** Skip any variant where `inventory_management != "shopify"`.
-These variants have `inventory_quantity = None` or a meaningless default — including them
-creates false stockout alerts. Only track what Shopify actually manages.
-
-**Skip variants with no SKU assigned.** Log a warning and continue; don't fail.
+The pipeline node does the fetching, filtering (skips untracked/no-SKU variants),
+and per-variant math in Steps 2-7 below — this is what you interpret when
+explaining results to the founder, not what you execute yourself.
 
 ---
 
