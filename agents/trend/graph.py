@@ -236,14 +236,14 @@ No alerts for score < 0.5.
     agent = create_agent(
         model           = model,
         tools           = all_tools,
-        prompt          = system_prompt,
+        system_prompt   = system_prompt,
         response_format = TrendAnalysis,
     )
 
     try:
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=user_message)]},
-            config={"recursion_limit": 50},   # ~25 tool-call iterations max
+            config={"recursion_limit": 20},   # ~25 tool-call iterations max
         )
         analysis: TrendAnalysis = result["structured_response"]
 
