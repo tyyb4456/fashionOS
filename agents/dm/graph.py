@@ -79,68 +79,7 @@ model = init_chat_model("google_genai:gemini-2.5-flash-lite")
 DM_FETCH_LIMIT = int(os.getenv("DM_FETCH_LIMIT", "30"))
 
 
-# ── Pydantic output schema ─────────────────────────────────────────────────────
-
-class _DmDecision(BaseModel):
-    """One classification + action per DM."""
-
-    message_id:       str
-    conversation_id:  str
-    user_id:          str
-    username:         str
-    original_message: str  # Truncated to 200 chars in state
-
-    category: str = Field(
-        description=(
-            "Exactly one of: "
-            "size_question | availability | order_status | "
-            "bulk_inquiry | complaint | influencer | spam | general_inquiry"
-        )
-    )
-
-    auto_send: bool = Field(
-        description=(
-            "True = send reply automatically via Instagram API. "
-            "True ONLY for: size_question, availability, order_status, general_inquiry. "
-            "False for: bulk_inquiry, complaint, influencer, spam."
-        )
-    )
-
-    reply_text: Optional[str] = Field(
-        default=None,
-        description=(
-            "Complete reply to send. Required if auto_send=True. None if flagging. "
-            "Max 500 characters. Brand voice: warm, conversational, Urdu-English mix welcome. "
-            "For availability: use the inventory data provided to give accurate stock status. "
-            "Never start with 'Dear Customer'. Use customer's @username if available."
-        )
-    )
-
-    flag_for_human: bool = Field(
-        description="True for: bulk_inquiry, complaint, influencer."
-    )
-    flag_priority: Optional[str] = Field(
-        default=None,
-        description="'high' (bulk_inquiry, complaint) | 'normal' (influencer) | None otherwise.",
-    )
-    flag_reason: Optional[str] = Field(
-        default=None,
-        description="Why this needs human attention. 1 sentence. Required if flag_for_human=True.",
-    )
-
-
-class _DmAnalysis(BaseModel):
-    decisions:        list[_DmDecision]
-    auto_send_count:  int
-    flagged_count:    int
-    summary: str = Field(
-        description=(
-            "2-3 sentence summary. "
-            "Example: '8 DMs processed. 5 auto-replied (3 availability, 2 size questions). "
-            "2 flagged: 1 bulk inquiry (50 units query from @retailer_pk) + "
-            "1 complaint (damaged item). 1 spam skipped.'"
-        )
-    )
+from response_schemas.dm_model import DmDecision, DmAnalysis
 
 
 # ── Subgraph state ─────────────────────────────────────────────────────────────
@@ -257,7 +196,7 @@ async def run_claude_analysis(state: DmAgentState) -> dict:
 
     if not raw_dms:
         print("[DM] No DMs to process.")
-        empty = _DmAnalysis(
+        empty = DmAnalysis(
             decisions=[], auto_send_count=0, flagged_count=0,
             summary="No unread DMs this cycle.",
         )
@@ -324,8 +263,8 @@ Classify each DM and draft a reply (if auto_send=True).
         "Classify and draft replies for each DM above."
     )
 
-    structured_llm = model.with_structured_output(_DmAnalysis)
-    analysis: _DmAnalysis = await structured_llm.ainvoke([
+    structured_llm = model.with_structured_output(DmAnalysis)
+    analysis: DmAnalysis = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_msg),
     ])
@@ -356,7 +295,7 @@ async def send_dm_replies(state: DmAgentState) -> dict:
     All processed DMs (sent and flagged) are written to state.dm_replies for
     the run summary and dashboard display.
     """
-    analysis = _DmAnalysis.model_validate_json(state["raw_analysis"])
+    analysis = DmAnalysis.model_validate_json(state["raw_analysis"])
     now_iso  = datetime.now(timezone.utc).isoformat()
 
     dm_replies: list[dict] = []

@@ -95,97 +95,7 @@ AUTO_EXECUTE_DECREASE_CEILING_PCT = float(
 _SKU_CONVENTION_RE = re.compile(r"FashionOS[_\-]([A-Z0-9\-]+)[_\-]", re.IGNORECASE)
 _SKU_FALLBACK_RE   = re.compile(r"\b([A-Z]{2,5}-\d{3}(?:-[A-Z]{1,2})?)\b")
 
-
-# ── Pydantic output schema ─────────────────────────────────────────────────────
-
-class _CampaignDecision(BaseModel):
-    """One budget/status decision per Meta campaign."""
-
-    campaign_id:   str
-    campaign_name: str
-    matched_sku:   Optional[str] = Field(
-        default=None,
-        description=(
-            "SKU extracted from campaign name. None if name doesn't follow the "
-            "FashionOS_{SKU}_{desc} convention — conservative hold applied."
-        ),
-    )
-
-    # Current state
-    current_daily_budget_pkr: float
-    current_status:           str   # "ACTIVE" | "PAUSED"
-    has_daily_budget:         bool  # False = ad-set level budgets, can't change at campaign level
-
-    # 7-day performance context
-    roas_7d:     Optional[float] = None   # None if pixel not configured
-    spend_7d_pkr: float           = 0.0
-    ctr_7d:       float           = 0.0
-    no_spend_data: bool           = False
-
-    action: str = Field(
-        description=(
-            "One of: 'hold' | 'increase_budget' | 'decrease_budget' | 'pause' | 'activate'. "
-            "'hold' = no change. 'pause' = stop spending. "
-            "'activate' = resume paused campaign (always pending_approval)."
-        )
-    )
-    new_daily_budget_pkr: Optional[float] = Field(
-        default=None,
-        description=(
-            "Target daily budget in PKR. Set for increase/decrease actions. "
-            "None for hold/pause/activate. "
-            "Apply budget change ceiling: ±30% max per cycle."
-        ),
-    )
-    change_pct: float = Field(
-        default=0.0,
-        description=(
-            "% change from current budget. Positive = increase, negative = decrease. "
-            "0 for hold/pause/activate."
-        ),
-    )
-
-    auto_execute: bool = Field(
-        description=(
-            "True = execute via Meta API now. "
-            "False = queue for human approval in dashboard. "
-            "Rules: "
-            "auto=True for: action='hold', action='pause', "
-            "action='decrease_budget' with |change_pct| ≤ 30. "
-            "auto=False for: action='increase_budget', action='activate'."
-        )
-    )
-    reason: str = Field(
-        description=(
-            "1-2 sentence explanation referencing actual numbers. "
-            "e.g. 'FOS-001-S is out of stock (3 units) — pausing campaign to stop driving "
-            "traffic to an unavailable product.' "
-            "OR 'Cargo pants trend score 0.82 (rising on TikTok PK) — "
-            "increasing budget from PKR 500 to PKR 650 to capture peak demand.'"
-        )
-    )
-    trigger: str = Field(
-        description=(
-            "What drove this decision. One of: "
-            "'out_of_stock' | 'clearance' | 'trending' | 'organic_viral' | "
-            "'low_roas' | 'healthy' | 'no_sku_match' | 'no_budget_control'"
-        )
-    )
-
-
-class _MarketingAnalysis(BaseModel):
-    """Complete structured output for one Marketing Agent run."""
-
-    decisions: list[_CampaignDecision]
-    summary: str = Field(
-        description=(
-            "2-3 sentence operational summary. "
-            "Example: '6 campaigns analysed. 2 paused (out-of-stock SKUs: FOS-003, FOS-007). "
-            "1 budget increase queued for approval (FOS-001 trending on TikTok). "
-            "3 held — performance healthy.'"
-        )
-    )
-
+from response_schemas.marketing_model import MarketingAnalysis
 
 # ── Subgraph state ─────────────────────────────────────────────────────────────
 
@@ -384,7 +294,7 @@ async def run_llm_analysis(state: MarketingAgentState) -> dict:
 
     if not campaigns:
         print("[Marketing] No campaigns to analyse.")
-        empty = _MarketingAnalysis(
+        empty = MarketingAnalysis(
             decisions=[],
             summary="No Meta campaigns found. Create campaigns following the FashionOS_{SKU}_{desc} naming convention.",
         )
@@ -503,8 +413,8 @@ Include EVERY campaign in decisions — even holds. No campaign may be omitted.
         "Produce marketing decisions for all campaigns above."
     )
 
-    structured_llm = model.with_structured_output(_MarketingAnalysis)
-    analysis: _MarketingAnalysis = await structured_llm.ainvoke([
+    structured_llm = model.with_structured_output(MarketingAnalysis)
+    analysis: MarketingAnalysis = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_msg),
     ])
@@ -539,7 +449,7 @@ async def execute_marketing_actions(state: MarketingAgentState) -> dict:
     All decisions (including holds and pending) are written to
     state.marketing_actions so the dashboard shows the full picture.
     """
-    analysis = _MarketingAnalysis.model_validate_json(state["raw_analysis"])
+    analysis = MarketingAnalysis.model_validate_json(state["raw_analysis"])
     now_iso  = datetime.now(timezone.utc).isoformat()
 
     marketing_actions: list[MarketingAction] = []
