@@ -174,20 +174,22 @@ async def get_conversation_messages(
     from deep_agents.streaming import REASONING_SENTINEL
 
     try:
-        # Load messages from LangGraph checkpoint
-        msgs = await get_thread_messages(
-            brand_id   = brand.brand_id,
-            brand_name = brand.brand_name,
-            thread_id  = thread_id,
+        # Checkpoint (Redis) and tool-results (Postgres) are independent —
+        # fetch concurrently instead of round-tripping one after the other.
+        msgs, tool_result_rows = await asyncio.gather(
+            get_thread_messages(
+                brand_id   = brand.brand_id,
+                brand_name = brand.brand_name,
+                thread_id  = thread_id,
+            ),
+            session.execute(
+                select(ChatToolResult)
+                .where(ChatToolResult.brand_id  == brand.brand_id)
+                .where(ChatToolResult.thread_id == thread_id)
+                .order_by(ChatToolResult.turn_index, ChatToolResult.created_at)
+            ),
         )
-
-        # Load persisted subagent results for this thread
-        rows = (await session.execute(
-            select(ChatToolResult)
-            .where(ChatToolResult.brand_id  == brand.brand_id)
-            .where(ChatToolResult.thread_id == thread_id)
-            .order_by(ChatToolResult.turn_index, ChatToolResult.created_at)
-        )).scalars().all()
+        rows = tool_result_rows.scalars().all()
 
         # Group by turn_index (0-based index of assistant messages). The
         # reasoning sentinel row is pulled out separately — it's persisted

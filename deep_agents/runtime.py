@@ -15,6 +15,7 @@ ChatHuggingFace model experiment are gone — the latter was dead code anyway
 (shadowed by `from deep_agents.load_model import llm` before it was ever used).
 """
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -24,8 +25,6 @@ from dotenv import load_dotenv
 from langgraph.store.redis.aio import AsyncRedisStore
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 
-from deep_agents import serialization  # noqa: F401 — applies monkeypatches on import
-from deep_agents.serialization import FASHIONOS_ALLOWED_MSGPACK
 from deep_agents.memory import ensure_brand_seeded
 from deep_agents.prompts import build_prompt
 from deep_agents.tools.db_tools import get_db_tools
@@ -59,10 +58,13 @@ async def get_checkpointer() -> AsyncRedisSaver:
     global _checkpointer
     if _checkpointer is None:
         _checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
-        # Patch the allowlist onto the existing internal serde instead of replacing
-        # it — replacing it breaks AsyncRedisSaver's own serde subclass
-        # (_preprocess_interrupts etc.)
-        _checkpointer.serde.allowed_msgpack_modules = FASHIONOS_ALLOWED_MSGPACK
+        # No custom msgpack allowlist needed — every tool in the current
+        # architecture (start_agent_analysis, check_agent_analysis_status,
+        # get_db_tools()) returns plain dicts/lists, and LangChain message
+        # types already have first-class serde support. The old allowlist
+        # existed only for the now-deleted subagents' Pydantic response
+        # schemas (InventoryAnalysis, TrendAnalysis, etc.) flowing directly
+        # into message history.
         await _checkpointer.asetup()
         print("[Checkpointer] ✓ AsyncRedisSaver ready")
     return _checkpointer
@@ -79,8 +81,7 @@ async def build_supervisor(brand_id: str, brand_name: str):
     (start_agent_analysis, check_agent_analysis_status), backed by Redis
     memory (/memories/AGENTS.md) and a read-only virtual /skills/ filesystem.
     """
-    store        = await get_store()
-    checkpointer = await get_checkpointer()
+    store, checkpointer = await asyncio.gather(get_store(), get_checkpointer())
 
     await ensure_brand_seeded(brand_id, brand_name, store)
 

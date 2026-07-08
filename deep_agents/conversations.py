@@ -122,38 +122,45 @@ async def get_thread_messages(brand_id: str, brand_name: str, thread_id: str) ->
     """
     Replay the human + AI messages for a thread.
 
-    Strategy (most reliable first):
-      1. agent.aget_state()        — fully deserialized LangChain message objects
-      2. checkpointer.aget_tuple() — raw checkpoint, channel_values.messages
+    Strategy (cheapest first):
+      1. checkpointer.aget_tuple() — raw checkpoint read via the shared Redis
+         singleton. No deep agent build needed (no LLM client, no skills
+         filesystem read, no tool registration) — this is what makes loading
+         chat history fast even for a brand whose agent isn't cached yet in
+         this process.
+      2. agent.aget_state()        — fully deserialized LangChain message
+         objects via the built agent. Only reached if (1) fails or returns
+         nothing; forces a full build_supervisor() for this brand as a
+         side effect, so it's deliberately the fallback, not the default.
     Both fall back gracefully and return [] on failure.
     """
     scoped_thread = f"{brand_id}:{thread_id}"
     config        = {"configurable": {"thread_id": scoped_thread}}
 
     try:
+        checkpointer = await get_checkpointer()
+        cp_tuple     = await checkpointer.aget_tuple(config)
+        if cp_tuple:
+            checkpoint   = cp_tuple.checkpoint or {}
+            raw_messages = (checkpoint.get("channel_values") or {}).get("messages", [])
+            if raw_messages:
+                result = await _extract_messages(raw_messages)
+                print(f"[Convos] checkpoint returned {len(result)} messages for {thread_id}")
+                return result
+        print(f"[Convos] no checkpoint messages for {thread_id}, trying full agent state")
+    except Exception as exc:
+        print(f"[Convos] checkpoint read failed ({exc}), falling back to agent state")
+
+    try:
         agent        = await get_cached_agent(brand_id, brand_name)
         state        = await agent.aget_state(config)
         raw_messages = (state.values or {}).get("messages", []) if state else []
-        if raw_messages:
-            result = await _extract_messages(raw_messages)
-            print(f"[Convos] aget_state returned {len(result)} messages for {thread_id}")
-            return result
-        print(f"[Convos] aget_state returned 0 messages for {thread_id}, trying checkpointer")
-    except Exception as exc:
-        print(f"[Convos] aget_state failed ({exc}), falling back to checkpointer")
-
-    try:
-        checkpointer = await get_checkpointer()
-        cp_tuple     = await checkpointer.aget_tuple(config)
-        if not cp_tuple:
-            print(f"[Convos] no checkpoint found for {thread_id}")
+        if not raw_messages:
+            print(f"[Convos] aget_state returned 0 messages for {thread_id}")
             return []
-
-        checkpoint   = cp_tuple.checkpoint or {}
-        raw_messages = (checkpoint.get("channel_values") or {}).get("messages", [])
         result = await _extract_messages(raw_messages)
-        print(f"[Convos] checkpoint fallback returned {len(result)} messages for {thread_id}")
+        print(f"[Convos] aget_state fallback returned {len(result)} messages for {thread_id}")
         return result
     except Exception as exc:
-        print(f"[Convos] checkpoint fallback failed: {exc}")
+        print(f"[Convos] agent state fallback failed: {exc}")
         return []

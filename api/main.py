@@ -4,6 +4,7 @@ FashionOS — FastAPI Application
 Session 8: Approvals router mounted. notify-mcp startup check added.
 """
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
@@ -46,6 +47,18 @@ async def lifespan(app: FastAPI):
         print(f"[FashionOS] ✓ notify-mcp configured ({NOTIFY_MCP_URL})")
     else:
         print("[FashionOS] △ NOTIFY_MCP_URL not set — WhatsApp/email notifications disabled")
+
+    # Warm the deep-agent Redis singletons (store + checkpointer) at boot.
+    # AsyncRedisStore.setup() / AsyncRedisSaver.asetup() create search
+    # indices the first time they run — doing that here means the first
+    # person to open /chat after a deploy doesn't personally eat that cost.
+    try:
+        from deep_agents.runtime import get_store, get_checkpointer
+        await asyncio.gather(get_store(), get_checkpointer())
+        print("[FashionOS] ✓ Deep agent Redis store + checkpointer warmed")
+    except Exception as e:
+        print(f"[FashionOS] △ Deep agent Redis warmup failed (will retry lazily): {e}")
+
 
     yield
     print("[FashionOS] Shutting down API.")
