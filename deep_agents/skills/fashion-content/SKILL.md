@@ -34,7 +34,7 @@ in inventory, trends, pricing, and paid ads.
 
 ## When to Run Content Planning
 
-Trigger the content-agent subagent when:
+Trigger a content planning run when:
 - Founder asks "what should I post today?", "what's ready to film?", "generate captions"
 - Daily pipeline has run and content is the next step
 - A trend alert fired and the founder wants content to match

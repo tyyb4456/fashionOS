@@ -39,7 +39,22 @@ class InventorySnapshotSchema(_Base):
     units_per_day:           float
     days_of_stock_remaining: float
     urgency:                 str
-    created_at:              datetime
+
+    # NEW — seasonal/trend-aware Inventory Agent
+    velocity_7d:                        float = 0.0
+    velocity_30d:                       float = 0.0
+    velocity_trend:                     str   = "stable"
+    velocity_confidence:                str   = "low"
+    seasonal_multiplier_applied:        float = 1.0
+    seasonal_context:                   str   = "off_season"
+    days_of_stock_remaining_unadjusted: float = 999.0
+    reorder_point_units:                int   = 0
+    has_pending_restock:                bool  = False
+    pending_restock_note:               Optional[str] = None
+    size_curve_deviation:               bool  = False
+    size_curve_note:                    Optional[str] = None
+
+    created_at: datetime
 
 
 class PricingActionSchema(_Base):
@@ -199,6 +214,19 @@ class RunDetailSchema(RunSummarySchema):
 # Dashboard widget schemas — updated
 # ══════════════════════════════════════════════════════════════════════════════
 
+class SeasonalContextSchema(BaseModel):
+    """
+    Mirrors agents.seasonal.current_seasonal_context(). Computed fresh on every
+    dashboard request — not stored, not tied to a specific run — so it's always
+    accurate to "today," independent of when the last agent run happened.
+    """
+    season_label:         str
+    demand_multiplier:    float
+    days_until_next_peak: Optional[int]  = None
+    next_peak_label:      Optional[str]  = None
+    next_peak_confirmed:  Optional[bool] = None
+
+
 class DashboardSummarySchema(BaseModel):
     """Single-object payload for the dashboard home screen."""
     brand_id:                  str
@@ -208,9 +236,9 @@ class DashboardSummarySchema(BaseModel):
     critical_alerts_open:      int
     pending_pricing_decisions: int
     pending_restock_orders:    int
-    # NEW session 6
     pending_marketing_actions: int = 0
     pending_content_posts:     int = 0
     open_return_insights:      int = 0
-    recent_runs:               list[RunSummarySchema] = []
-    critical_alerts:           list[AlertSchema]      = []
+    seasonal_context:          SeasonalContextSchema   # NEW
+    recent_runs:                list[RunSummarySchema] = []
+    critical_alerts:            list[AlertSchema]      = []

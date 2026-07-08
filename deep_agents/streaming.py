@@ -14,6 +14,7 @@ import json
 from collections.abc import AsyncGenerator
 
 from pydantic import BaseModel as _PydanticBase
+from requests import session
 
 from deep_agents.runtime import get_cached_agent
 
@@ -35,6 +36,39 @@ PERSISTABLE_TOOLS: set[str] = {
     "get_run_history",
 }
 
+# Sentinel label for persisted reasoning rows in chat_tool_results.
+# Reasoning isn't a tool result — it's the model's own thinking for the turn —
+# but reusing the same table avoids a second one. get_conversation_messages()
+# in api/routers/chat.py pulls rows with this label out separately from the
+# real tool-result cards.
+REASONING_SENTINEL = "__reasoning__"
+
+
+async def _save_reasoning(
+    brand_id: str,
+    thread_id: str,
+    turn_index: int,
+    reasoning_text: str,
+) -> None:
+    """
+    Fire-and-forget: persist the full reasoning text for this turn so the
+    ReasoningBlock survives a page reload / switching conversations, instead
+    of vanishing the moment the live SSE stream ends.
+    """
+    from db.session import AsyncSessionLocal
+    from db.models  import ChatToolResult
+
+    try:
+        async with AsyncSessionLocal() as session:
+            session.add(ChatToolResult(
+                brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
+                label=REASONING_SENTINEL, summary=reasoning_text, data=None,
+            ))
+
+            await session.commit()
+    except Exception as exc:
+        print(f"[Streaming] ⚠ Failed to persist reasoning: {exc}")
+
 
 async def _save_tool_result(
     brand_id: str,
@@ -46,16 +80,16 @@ async def _save_tool_result(
 ) -> None:
     """
     Fire-and-forget: persist one tool result row so the frontend can render a
-    rich card (pipeline status, inventory table, pending approvals, etc.) when
-    conversation history is reloaded — not just the assistant's prose.
+    chat_tool_results (see db/models.py) so the frontend can render a rich card
+    when conversation history is reloaded, not just prose.
 
-    Reuses chat_subagent_results unchanged — no migration needed. For
+    Reuses chat_tool_results unchanged — no migration needed. For
     check_agent_analysis_status, agent_name holds the real FashionOS agents
     that ran (e.g. "inventory,trend,pricing") instead of the generic tool name
     — more useful to a human scanning history later.
     """
     from db.session import AsyncSessionLocal
-    from db.models  import ChatSubagentResult
+    from db.models  import ChatToolResult
 
     label = tool_name
     if tool_name == "check_agent_analysis_status":
@@ -65,9 +99,9 @@ async def _save_tool_result(
 
     try:
         async with AsyncSessionLocal() as session:
-            session.add(ChatSubagentResult(
+            session.add(ChatToolResult(
                 brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
-                agent_name=label, summary=summary, data=data,
+                label=label, summary=summary, data=data,
             ))
             await session.commit()
     except Exception as exc:
@@ -123,6 +157,7 @@ async def stream_chat(
     # Maps tool_call_id → tool name, so we can label the matching ToolMessage
     # result when it streams back on a LATER chunk.
     tc_id_to_tool: dict[str, str] = {}
+    reasoning_accum = ""   # full reasoning text for this turn — saved once the stream ends
 
     try:
         async for chunk in agent.astream(
@@ -167,6 +202,7 @@ async def stream_chat(
                 text           = str(raw)
 
             if reasoning_text:
+                reasoning_accum += reasoning_text
                 yield {"type": "reasoning", "name": None, "content": reasoning_text}
 
             # ── Detect tool-call requests on this chunk ─────────────────────
@@ -227,5 +263,11 @@ async def stream_chat(
 
     except Exception as exc:
         yield {"type": "error", "content": str(exc)}
+
+    if reasoning_accum:
+        asyncio.ensure_future(_save_reasoning(
+            brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
+            reasoning_text=reasoning_accum,
+        ))
 
     yield {"type": "done"}

@@ -35,7 +35,7 @@ inventory and on TikTok — automatically, every cycle. No manual campaign monit
 
 ## When to Run Marketing Analysis
 
-Trigger the marketing-agent subagent when:
+Trigger a marketing analysis run when:
 - Founder asks "how are my ads doing?", "what campaigns should I pause?",
   "is my ad spend efficient?", "what's pending approval for ads?"
 - Daily pipeline run — after inventory, trend, pricing agents have run

@@ -18,6 +18,9 @@ from api.routers import webhooks
 from api.routers import runs
 from api.routers import webhooks, runs, approvals, brands, clerk_webhooks, oauth, chat
 
+import sys
+sys.dont_write_bytecode = True
+
 APP_VERSION = "0.2.0"
 BRAND_NAME  = os.getenv("BRAND_NAME", "FashionOS Brand")
 ENV         = os.getenv("ENV", "development")

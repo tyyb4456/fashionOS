@@ -126,7 +126,7 @@ Never end in round 00, 50, or any digit other than 9.
 
 ## Interpreting PricingAnalysis Output
 
-When the pricing subagent returns its structured output, check these fields:
+When the pricing analysis returns its structured output, check these fields:
 
 ```
 decision.executed = True   → price has already been changed in Shopify this run

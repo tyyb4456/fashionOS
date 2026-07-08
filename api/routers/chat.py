@@ -55,7 +55,7 @@ class ConversationMeta(BaseModel):
     updated_at: str
 
 
-class SubagentResultOut(BaseModel):
+class ToolResultOut(BaseModel):
     name:    str
     summary: str
     data:    dict | None = None
@@ -65,7 +65,8 @@ class SubagentResultOut(BaseModel):
 class MessageOut(BaseModel):
     role:      str   # "user" | "assistant"
     content:   str
-    subagents: list[SubagentResultOut] = []
+    subagents: list[ToolResultOut] = []
+    reasoning: str = ""
 
 
 # ── Non-streaming chat ─────────────────────────────────────────────────────────
@@ -168,8 +169,9 @@ async def get_conversation_messages(
 
     from sqlalchemy import select
 
-    from db.models import ChatSubagentResult
+    from db.models import ChatToolResult
     from deep_agents.supervisor import get_thread_messages
+    from deep_agents.streaming import REASONING_SENTINEL
 
     try:
         # Load messages from LangGraph checkpoint
@@ -181,17 +183,23 @@ async def get_conversation_messages(
 
         # Load persisted subagent results for this thread
         rows = (await session.execute(
-            select(ChatSubagentResult)
-            .where(ChatSubagentResult.brand_id  == brand.brand_id)
-            .where(ChatSubagentResult.thread_id == thread_id)
-            .order_by(ChatSubagentResult.turn_index, ChatSubagentResult.created_at)
+            select(ChatToolResult)
+            .where(ChatToolResult.brand_id  == brand.brand_id)
+            .where(ChatToolResult.thread_id == thread_id)
+            .order_by(ChatToolResult.turn_index, ChatToolResult.created_at)
         )).scalars().all()
 
-        # Group by turn_index (0-based index of assistant messages)
-        subagents_by_turn: dict[int, list[SubagentResultOut]] = defaultdict(list)
+        # Group by turn_index (0-based index of assistant messages). The
+        # reasoning sentinel row is pulled out separately — it's persisted
+        # text for the ReasoningBlock, not a tool-result card.
+        tool_results_by_turn: dict[int, list[ToolResultOut]] = defaultdict(list)
+        reasoning_by_turn: dict[int, str] = {}
         for row in rows:
-            subagents_by_turn[row.turn_index].append(SubagentResultOut(
-                name    = row.agent_name,
+            if row.label == REASONING_SENTINEL:
+                reasoning_by_turn[row.turn_index] = row.summary or ""
+                continue
+            tool_results_by_turn[row.turn_index].append(ToolResultOut(
+                name    = row.label,
                 summary = row.summary or "",
                 data    = row.data,
                 status  = "done",
@@ -205,7 +213,8 @@ async def get_conversation_messages(
                 enriched.append(MessageOut(
                     role      = m["role"],
                     content   = m.get("content", ""),
-                    subagents = subagents_by_turn.get(asst_idx, []),
+                    tool_results = tool_results_by_turn.get(asst_idx, []),
+                    reasoning = reasoning_by_turn.get(asst_idx, ""),
                 ))
                 asst_idx += 1
             else:

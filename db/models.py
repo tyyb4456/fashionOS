@@ -104,10 +104,26 @@ class InventorySnapshotRecord(Base):
 
     urgency: Mapped[str] = mapped_column(String(20), nullable=False, default="healthy")
 
+    # NEW — seasonal/trend-aware Inventory Agent
+    velocity_7d:         Mapped[float] = mapped_column(Float,      nullable=False, default=0.0)
+    velocity_30d:        Mapped[float] = mapped_column(Float,      nullable=False, default=0.0)
+    velocity_trend:      Mapped[str]   = mapped_column(String(20), nullable=False, default="stable")
+    velocity_confidence: Mapped[str]   = mapped_column(String(10), nullable=False, default="low")
+
+    seasonal_multiplier_applied:        Mapped[float] = mapped_column(Float,      nullable=False, default=1.0)
+    seasonal_context:                   Mapped[str]   = mapped_column(String(50), nullable=False, default="off_season")
+    days_of_stock_remaining_unadjusted: Mapped[float] = mapped_column(Float,      nullable=False, default=999.0)
+
+    reorder_point_units:  Mapped[int]           = mapped_column(Integer, nullable=False, default=0)
+    has_pending_restock:  Mapped[bool]          = mapped_column(Boolean, nullable=False, default=False)
+    pending_restock_note: Mapped[Optional[str]] = mapped_column(Text,    nullable=True)
+
+    size_curve_deviation: Mapped[bool]          = mapped_column(Boolean, nullable=False, default=False)
+    size_curve_note:      Mapped[Optional[str]] = mapped_column(Text,    nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # pricing_actions
@@ -312,21 +328,21 @@ class ReturnInsightRecord(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# chat_subagent_results  — persists structured subagent output per chat turn
+# chat_tool_results  — persists structured tool output per chat turn
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ChatSubagentResult(Base):
+class ChatToolResult(Base):
     """
-    One row per subagent fired during a chat stream.
+    One row per tool call (or persisted reasoning block) during a chat turn.
 
-    Keyed by (brand_id, thread_id, turn_index, agent_name).
+    Keyed by (brand_id, thread_id, turn_index, label).
     turn_index = 0-based index of the assistant message this belongs to,
     computed by counting existing AI messages in the checkpoint at stream start.
 
     data column stores the full structured JSON (InventoryAnalysis, etc.)
     so the frontend can render rich cards when loading conversation history.
     """
-    __tablename__ = "chat_subagent_results"
+    __tablename__ = "chat_tool_results"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -335,7 +351,10 @@ class ChatSubagentResult(Base):
     thread_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
     turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    agent_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Human-readable label for this row: a tool name (get_inventory_status),
+    # a comma-joined list of pipeline agents that ran (inventory,trend,pricing),
+    # or the reasoning sentinel (see deep_agents/streaming.py REASONING_SENTINEL).
+    label: Mapped[str] = mapped_column(String(100), nullable=False)
 
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     data:    Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)

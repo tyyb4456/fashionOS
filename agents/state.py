@@ -16,9 +16,23 @@ class InventorySnapshot(TypedDict):
     product_title:          str
     variant_title:          str
     current_stock:          int
-    units_per_day:          float
-    days_of_stock_remaining: float
-    urgency:                str   # "critical" | "high" | "normal" | "healthy"
+    units_per_day:          float    # 7-day velocity (was a flat 14d average)
+    days_of_stock_remaining: float   # seasonally-adjusted forecast
+    urgency:                str      # "critical" | "high" | "normal" | "healthy"
+
+    # NEW — seasonal/trend-aware Inventory Agent
+    velocity_7d:                        float
+    velocity_30d:                       float
+    velocity_trend:                     str    # "accelerating" | "stable" | "decelerating" | "new_item" | "no_movement"
+    velocity_confidence:                str    # "high" | "medium" | "low"
+    seasonal_multiplier_applied:        float
+    seasonal_context:                   str
+    days_of_stock_remaining_unadjusted: float
+    reorder_point_units:                int
+    has_pending_restock:                bool
+    pending_restock_note:               Optional[str]
+    size_curve_deviation:                bool
+    size_curve_note:                     Optional[str]
 
 
 class TrendSignal(TypedDict):

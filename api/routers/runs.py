@@ -44,7 +44,9 @@ from db.schemas import (
     ReturnInsightSchema,
     RunDetailSchema,
     RunSummarySchema,
+    SeasonalContextSchema,
 )
+from agents.seasonal import current_seasonal_context
 from db.session import get_session
 
 
@@ -336,7 +338,6 @@ async def get_dashboard(
     recent_limit: int          = Query(10, ge=1, le=50),
     session:      AsyncSession = Depends(get_session),
 ) -> DashboardSummarySchema:
-    # Fetch all needed data
     recent_runs          = await crud.list_runs(session, brand_id=brand.brand_id, limit=recent_limit)
     critical_alerts      = await crud.get_critical_alerts(session, brand_id=brand.brand_id, limit=10)
     pending_pricing      = await crud.get_pending_pricing(session, brand_id=brand.brand_id, limit=500)
@@ -348,10 +349,7 @@ async def get_dashboard(
     last_run = recent_runs[0] if recent_runs else None
 
     today = datetime.now(timezone.utc).date()
-    total_runs_today = sum(
-        1 for r in recent_runs
-        if r.created_at.date() == today
-    )
+    total_runs_today = sum(1 for r in recent_runs if r.created_at.date() == today)
 
     return DashboardSummarySchema(
         brand_id                  = brand.brand_id,
@@ -364,6 +362,7 @@ async def get_dashboard(
         pending_marketing_actions = len(pending_marketing),
         pending_content_posts     = len(pending_content),
         open_return_insights      = len(open_return_insights),
-        recent_runs               = [RunSummarySchema.model_validate(r) for r in recent_runs],
-        critical_alerts           = [AlertSchema.model_validate(a) for a in critical_alerts],
+        seasonal_context           = SeasonalContextSchema(**current_seasonal_context()),
+        recent_runs                 = [RunSummarySchema.model_validate(r) for r in recent_runs],
+        critical_alerts              = [AlertSchema.model_validate(a) for a in critical_alerts],
     )

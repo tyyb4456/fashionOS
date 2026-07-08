@@ -25,7 +25,7 @@ FashionOS never auto-orders. Money leaving the business requires human sign-off.
 
 ## When to Run Restock Analysis
 
-Trigger the restock-agent subagent when:
+Trigger a restock analysis run when:
 - Founder asks "what do I need to restock?", "what orders should go out?",
   "show me what to order this week", "give me the WhatsApp messages for suppliers"
 - Daily pipeline run (always after inventory + pricing)
@@ -142,7 +142,7 @@ This is enforced in the subagent, but worth verifying:
 
 ## Supplier Batch Messages
 
-The subagent produces two levels of WhatsApp content:
+The restock agent produces two levels of WhatsApp content:
 
 **Individual SKU message** (`supplier_message` field per decision)
 Used for single-SKU orders or when presenting to the founder SKU-by-SKU.
@@ -164,7 +164,7 @@ Lead time: [lead_days] days | Deadline: [earliest order_deadline]
 
 ## Cost Estimate Reference
 
-The subagent uses category heuristics since Shopify doesn't store COGS.
+The restock agent uses category heuristics since Shopify doesn't store COGS.
 
 | Product signals | Estimated landed cost PKR |
 |-----------------|--------------------------|

@@ -26,7 +26,7 @@ cross-referenced to produce scored, directional signals mapped to catalog SKUs.
 
 ## When to Run Trend Research
 
-Trigger the trend-agent subagent when:
+Trigger a trend research run when:
 - Founder asks "what's trending?", "what should I post?", "what's hot right now?"
 - Pipeline hasn't run in > 6 hours and a content or ad decision is pending
 - An inventory SKU is sitting with zero velocity — trends data may explain why

@@ -113,6 +113,18 @@ async def save_run(
             units_per_day           = snap.get("units_per_day", 0.0),
             days_of_stock_remaining = snap.get("days_of_stock_remaining", 999.0),
             urgency                 = snap.get("urgency", "healthy"),
+            velocity_7d                        = snap.get("velocity_7d", 0.0),
+            velocity_30d                       = snap.get("velocity_30d", 0.0),
+            velocity_trend                     = snap.get("velocity_trend", "stable"),
+            velocity_confidence                = snap.get("velocity_confidence", "low"),
+            seasonal_multiplier_applied        = snap.get("seasonal_multiplier_applied", 1.0),
+            seasonal_context                   = snap.get("seasonal_context", "off_season"),
+            days_of_stock_remaining_unadjusted = snap.get("days_of_stock_remaining_unadjusted", 999.0),
+            reorder_point_units                = snap.get("reorder_point_units", 0),
+            has_pending_restock                = snap.get("has_pending_restock", False),
+            pending_restock_note               = snap.get("pending_restock_note"),
+            size_curve_deviation                = snap.get("size_curve_deviation", False),
+            size_curve_note                     = snap.get("size_curve_note"),
         ))
 
     # ── 3. Pricing actions ────────────────────────────────────────────────────
@@ -301,6 +313,26 @@ async def get_pending_pricing(
         )
         .order_by(desc(PricingActionRecord.created_at))
         .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_restocks_in_flight(
+    session: AsyncSession,
+    brand_id: str,
+) -> list[RestockRecommendationRecord]:
+    """
+    SKUs with a restock already pending_approval, approved, or ordered.
+    Used by the Inventory Agent to avoid re-raising a duplicate critical
+    alert on a SKU that's already been handled.
+    """
+    result = await session.execute(
+        select(RestockRecommendationRecord)
+        .where(
+            RestockRecommendationRecord.brand_id == brand_id,
+            RestockRecommendationRecord.status.in_(["pending_approval", "approved", "ordered"]),
+        )
+        .order_by(desc(RestockRecommendationRecord.created_at))
     )
     return list(result.scalars().all())
 
