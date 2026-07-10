@@ -83,21 +83,24 @@ class RestockRecommendation(TypedDict):
 
 
 class MarketingAction(TypedDict):
-    """
-    One budget/status decision per Meta campaign.
-
-    Extended in session 6 to include campaign_id, campaign_name,
-    auto_executed, and trigger — needed for DB persistence and
-    dashboard display without joining against alerts.
-    """
+    """One budget/status decision per Meta campaign."""
     sku:           str
     campaign_id:   str
     campaign_name: str
     action:        str   # "hold" | "increase_budget" | "decrease_budget" | "pause" | "activate"
     reason:        str
-    amount_delta:  Optional[float]  # PKR change in daily budget (positive = increase)
     auto_executed: bool
-    trigger:       str   # "out_of_stock" | "clearance" | "trending" | "organic_viral" | "low_roas" | "healthy" | "no_sku_match"
+    trigger:       str   # "no_sku_match" | "no_budget_control" | "out_of_stock" | "clearance" |
+                          # "trending_increase" | "trending_hold_low_roas" | "organic_viral" |
+                          # "low_roas_pause" | "low_roas_decrease" | "healthy"
+
+    # NEW — deterministic marketing intelligence (replaces amount_delta)
+    current_budget_pkr: float
+    new_budget_pkr:      Optional[float]
+    change_pct:            float
+    roas_7d:                Optional[float]
+    spend_7d_pkr:            float
+    ctr_7d:                   float
 
 
 class ReturnInsightData(TypedDict):

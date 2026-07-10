@@ -140,6 +140,11 @@ class MarketingActionSchema(_Base):
     auto_executed:       bool
     reason:              Optional[str]
     trigger:             Optional[str]
+
+    # NEW
+    roas_7d:      Optional[float] = None
+    spend_7d_pkr:  float = 0.0
+    ctr_7d:         float = 0.0
     created_at:          datetime
 
 

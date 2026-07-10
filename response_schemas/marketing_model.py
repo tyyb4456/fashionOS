@@ -90,3 +90,55 @@ class MarketingAnalysis(BaseModel):
             "3 held — performance healthy.'"
         )
     )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Deterministic-math rewrite additions
+# Node 2 (compute_marketing_plan) computes CampaignPlanItem entirely in Python —
+# the decision framework (SKU match → budget control → stock → clearance →
+# trend → organic viral → ROAS → healthy) is a rule table, not judgment.
+# Node 3 (generate_marketing_copy) is the ONLY LLM call — it only writes
+# `reason` text for non-hold campaigns and a summary. CampaignDecision /
+# MarketingAnalysis above are kept for backward compat.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CampaignPlanItem(BaseModel):
+    """Deterministically computed by agents/marketing/graph.py::compute_marketing_plan. No LLM involved."""
+    campaign_id:   str
+    campaign_name: str
+    sku:           Optional[str] = None
+    follows_convention: bool
+
+    current_status:     str
+    has_daily_budget:    bool
+    current_budget_pkr:   float
+
+    roas_7d:        Optional[float] = None
+    spend_7d_pkr:    float = 0.0
+    ctr_7d:           float = 0.0
+    no_spend_data:     bool = True
+
+    action:         str     # "hold" | "increase_budget" | "decrease_budget" | "pause" | "activate"
+    new_budget_pkr:  Optional[float] = None
+    change_pct:       float = 0.0
+    auto_execute:      bool
+    trigger:            str  # "no_sku_match" | "no_budget_control" | "out_of_stock" | "clearance" |
+                              # "trending_increase" | "trending_hold_low_roas" | "organic_viral" |
+                              # "low_roas_pause" | "low_roas_decrease" | "healthy"
+
+
+class MarketingCopyOut(BaseModel):
+    """LLM-authored reason for one non-hold campaign. Every number is already final —
+    reference it, never recompute or contradict it."""
+    campaign_id: str
+    reason:       str = Field(description="1-2 sentences referencing the given action, numbers, and trigger context.")
+
+
+class MarketingCopyPlan(BaseModel):
+    """The ONLY structured LLM output for the Marketing Agent."""
+    items:   list[MarketingCopyOut]
+    summary: str = Field(
+        description=(
+            "2-3 sentence operational summary. Lead with what's paused/auto-executed. "
+            "Mention pending budget increases with the most promising SKU."
+        )
+    )

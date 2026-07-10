@@ -148,6 +148,10 @@ class PricingActionRecord(Base):
 
     # NEW — deterministic pricing intelligence
     trigger:                  Mapped[str]              = mapped_column(String(50), nullable=False, default="healthy")
+    # NEW — deterministic marketing intelligence
+    roas_7d:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    spend_7d_pkr:  Mapped[float]           = mapped_column(Float, nullable=False, default=0.0)
+    ctr_7d:         Mapped[float]           = mapped_column(Float, nullable=False, default=0.0)
     markdown_rung:             Mapped[int]               = mapped_column(Integer, nullable=False, default=0)
     estimated_unit_cost_pkr:    Mapped[Optional[float]]   = mapped_column(Float, nullable=True)
     estimated_margin_pct:       Mapped[Optional[float]]   = mapped_column(Float, nullable=True)

@@ -241,7 +241,7 @@ async def run_marketing_agent(state: FashionOSState) -> dict:
         "inventory_snapshot": state.get("inventory_snapshot", []),
         "trend_signals": state.get("trend_signals", []),
         "pricing_recommendations": state.get("pricing_recommendations", []),
-        "campaigns": [], "skill_content": "", "raw_analysis": "",
+        "campaigns": [], "computed_plan": [], "raw_copy": "",
         "marketing_actions": [], "alerts": [],
     })
     paused = [a for a in result["marketing_actions"] if a.get("action") == "pause"]

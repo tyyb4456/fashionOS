@@ -193,12 +193,15 @@ async def save_run(
             campaign_id        = act.get("campaign_id", ""),
             campaign_name      = act.get("campaign_name", ""),
             action             = act.get("action", "hold"),
-            current_budget_pkr = abs(act.get("amount_delta", 0.0) or 0.0),
-            new_budget_pkr     = None,
-            change_pct         = 0.0,
+            current_budget_pkr = act.get("current_budget_pkr", 0.0),
+            new_budget_pkr     = act.get("new_budget_pkr"),
+            change_pct         = act.get("change_pct", 0.0),
             auto_executed      = act.get("auto_executed", False),
             reason             = act.get("reason"),
             trigger            = act.get("trigger"),
+            roas_7d            = act.get("roas_7d"),
+            spend_7d_pkr       = act.get("spend_7d_pkr", 0.0),
+            ctr_7d             = act.get("ctr_7d", 0.0),
         ))
 
     # ── 7. Content posts ──────────────────────────────────────────────────────
