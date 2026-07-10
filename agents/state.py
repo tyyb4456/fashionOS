@@ -48,10 +48,18 @@ class PricingRecommendation(TypedDict):
     variant_id:       int
     current_price:    float
     recommended_price: float
-    action:           str   # "hold" | "increase" | "markdown" | "bundle"
+    action:           str   # "hold" | "increase" | "markdown" | "clearance_code"
     discount_pct:     float
     reason:           str
 
+    # NEW — deterministic pricing intelligence
+    auto_executed:            bool
+    trigger:                   str      # see agents/pricing/graph.py _HOLD_REASON_BY_TRIGGER for the full set
+    markdown_rung:              int      # rung AFTER this decision (0=full price, 1≈15%, 2≈25%, 3=clearance)
+    estimated_unit_cost_pkr:    Optional[float]
+    estimated_margin_pct:       Optional[float]
+    suggested_discount_code:    Optional[str]
+    new_compare_at_price:        Optional[float]
 
 class RestockRecommendation(TypedDict):
     sku:                      str

@@ -69,6 +69,15 @@ class PricingActionSchema(_Base):
     discount_pct:      float
     auto_executed:     bool
     reason:            Optional[str]
+
+    # NEW
+    trigger:                  str = "healthy"
+    markdown_rung:              int = 0
+    estimated_unit_cost_pkr:    Optional[float] = None
+    estimated_margin_pct:       Optional[float] = None
+    suggested_discount_code:    Optional[str] = None
+    new_compare_at_price:        Optional[float] = None
+    
     created_at:        datetime
 
 

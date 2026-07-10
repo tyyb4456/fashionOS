@@ -129,21 +129,23 @@ async def save_run(
 
     # ── 3. Pricing actions ────────────────────────────────────────────────────
     for rec in state.get("pricing_recommendations", []):
-        action  = rec.get("action", "hold")
-        is_auto = (action == "hold") or (
-            action == "markdown" and rec.get("discount_pct", 0) <= 15
-        )
         session.add(PricingActionRecord(
             run_id            = run_id,
             brand_id          = summary["brand_id"],
             sku               = rec.get("sku", ""),
             variant_id        = rec.get("variant_id"),
-            action            = action,
+            action            = rec.get("action", "hold"),
             current_price     = rec.get("current_price", 0.0),
             recommended_price = rec.get("recommended_price", 0.0),
             discount_pct      = rec.get("discount_pct", 0.0),
-            auto_executed     = is_auto,
+            auto_executed     = rec.get("auto_executed", False),
             reason            = rec.get("reason"),
+            trigger                  = rec.get("trigger", "healthy"),
+            markdown_rung             = rec.get("markdown_rung", 0),
+            estimated_unit_cost_pkr   = rec.get("estimated_unit_cost_pkr"),
+            estimated_margin_pct      = rec.get("estimated_margin_pct"),
+            suggested_discount_code   = rec.get("suggested_discount_code"),
+            new_compare_at_price       = rec.get("new_compare_at_price"),
         ))
 
     # ── 4. Alerts ─────────────────────────────────────────────────────────────

@@ -162,7 +162,8 @@ async def run_pricing_agent(state: FashionOSState) -> dict:
         "inventory_snapshot": state.get("inventory_snapshot", []),
         "trend_signals": state.get("trend_signals", []),
         "products": [], "sales_velocity": [], "existing_price_rules": [],
-        "skill_content": "", "raw_analysis": "", "pricing_recommendations": [], "alerts": [],
+        "computed_plan": [], "raw_copy": "",
+        "pricing_recommendations": [], "alerts": [],
     })
     print(f"[Supervisor] ✓ Pricing: {len(result['pricing_recommendations'])} decisions, {len(result['alerts'])} alerts.")
     return {

@@ -114,11 +114,10 @@ async def approve_pricing_decision(
         if "update_product_price" not in tool_map:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="shopify-mcp unavailable.")
 
-        # For clearance_code action, only apply the price change (code creation is manual)
         raw = await tool_map["update_product_price"].ainvoke({
             "variant_id":       rec.variant_id,
             "new_price":        rec.recommended_price,
-            "compare_at_price": rec.current_price if rec.action == "markdown" else None,
+            "compare_at_price": rec.new_compare_at_price,
             "reason":           f"[APPROVED] {rec.reason or rec.action}",
             "brand_id":         brand.brand_id,
         })

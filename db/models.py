@@ -146,6 +146,14 @@ class PricingActionRecord(Base):
     auto_executed:     Mapped[bool]  = mapped_column(Boolean,     nullable=False, default=False)
     reason:            Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # NEW — deterministic pricing intelligence
+    trigger:                  Mapped[str]              = mapped_column(String(50), nullable=False, default="healthy")
+    markdown_rung:             Mapped[int]               = mapped_column(Integer, nullable=False, default=0)
+    estimated_unit_cost_pkr:    Mapped[Optional[float]]   = mapped_column(Float, nullable=True)
+    estimated_margin_pct:       Mapped[Optional[float]]   = mapped_column(Float, nullable=True)
+    suggested_discount_code:    Mapped[Optional[str]]     = mapped_column(String(100), nullable=True)
+    new_compare_at_price:        Mapped[Optional[float]]   = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
