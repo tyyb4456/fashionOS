@@ -13,7 +13,7 @@ Session 6 additions:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 from uuid import UUID
 
@@ -95,6 +95,16 @@ class RestockRecommendationSchema(_Base):
     reason:                  str
     supplier_message:        str
     status:                  str
+
+    # NEW
+    supplier_type:            str = "lahore_local"
+    estimated_lead_days:      int = 0
+    expected_stockout_date:   Optional[date] = None
+    order_deadline:           Optional[date] = None
+    is_overdue:                bool = False
+    estimated_unit_cost_pkr:   Optional[float] = None
+    estimated_total_cost_pkr:  Optional[float] = None
+    priority:                  int = 0
     created_at:              datetime
 
 

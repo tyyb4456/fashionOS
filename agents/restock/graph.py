@@ -1,71 +1,71 @@
 """
-Restock Agent — FashionOS Phase 2 Operations
-=============================================
-Reads inventory_snapshot and pricing_recommendations already in state
-(set by Inventory Agent and Pricing Agent). Identifies SKUs that need
-restocking — critical/high urgency items that aren't being clearanced.
-Calculates recommended order quantities using supplier lead times from
-the fashion_inventory skill. Generates supplier WhatsApp messages.
+Restock Agent — FashionOS Phase 2 Operations (deterministic-math rewrite)
+===========================================================================
+Reads inventory_snapshot and pricing_recommendations already in state.
+ALL quantity math, supplier classification, dates, and cost estimates are
+computed in plain Python (Node 2) — the LLM (Node 3) only writes natural-
+language supplier messages, reasons, and a summary on top of numbers that
+are already final.
 
-Graph topology  (4 nodes, sequential):
+Graph topology (4 nodes, sequential):
 
     START
       │
       ▼
-  prepare_restock_data     ← Node 1: NO MCP — reads inventory_snapshot +
-      │                               pricing_recommendations from state.
-      │                               Filters to restock candidates.
+  prepare_restock_data   ← Node 1: NO MCP — reads inventory_snapshot +
+      │                             pricing_recommendations from state.
+      │                             Filters to critical/high urgency.
       ▼
-  load_domain_skill        ← Node 2: load_skill("fashion_inventory")
-      │                               Contains supplier lead time data.
+  compute_restock_plan   ← Node 2: PURE PYTHON. should_restock gate,
+      │                             quantity formula, supplier classification,
+      │                             stockout/deadline dates, cost estimates,
+      │                             priority ordering. No LLM.
       ▼
-  run_claude_analysis      ← Node 3: Structured LLM call.
-      │                               Produces RestockDecision list with
-      │                               quantity, supplier type, WhatsApp message.
+  generate_copy          ← Node 3: THE ONLY LLM CALL. Given the fully
+      │                             computed plan, writes per-SKU reasons,
+      │                             per-SKU + consolidated-batch WhatsApp
+      │                             messages (Urdu-English), and a summary.
+      │                             Loads fashion_inventory skill inline.
       ▼
-  execute_restock_actions  ← Node 4: Calls create_restock_recommendation
-      │                               via shopify-mcp for each decision.
-      │                               Writes restock_recommendations + alerts.
+  execute_restock_actions← Node 4: Merges plan + copy, calls
+      │                             create_restock_recommendation via
+      │                             shopify-mcp, writes restock_recommendations
+      │                             + alerts (overdue → critical alert).
       ▼
     END
 
-Key design decisions:
-  - Node 1 is pure Python (no MCP) — data is already in state from prior agents.
-    This is the composability benefit of the shared FashionOSState pattern.
-  - Skip clearance SKUs: if Pricing Agent has already decided to clear a SKU,
-    restocking it would be contradictory. We read pricing_action per SKU and
-    exclude clearance_code decisions from the restock candidates.
-  - ALL restock recommendations are pending_approval — no auto-ordering.
-    Humans approve every purchase order in the dashboard. This is a deliberate
-    trust boundary (money leaving the business requires human sign-off).
-  - Supplier WhatsApp messages are generated in Urdu-English mix (Pakistani
-    supplier context) — ready to paste into WhatsApp without editing.
+DEDUP FIX (closes the flagged bug): Node 1 reads has_pending_restock /
+pending_restock_note straight off inventory_snapshot — the Inventory Agent
+already computes this every run (fresh DB check). No extra DB call needed
+here; Restock just trusts state. Node 2 gates should_restock=False on it.
 
-Quantity formula:
-  recommended_qty = ceil(units_per_day × (lead_time + 7)) - current_stock
-  Where:
-    lead_time = supplier type lead time in days
-    7         = safety buffer days
-  Minimum order: 20 units (MOQ floor)
-  Maximum order: units_per_day × 60 (2-month supply cap)
+Quantity formula (Node 2):
+  raw = ceil(units_per_day × (lead_time + 7)) - current_stock
+  if raw <= 0: no restock
+  raw = max(raw, 20)                      ← MOQ floor wins over the cap below
+  cap = ceil(units_per_day × 60)          ← 2-month supply cap
+  if cap >= 20: raw = min(raw, cap)
 
-Supplier lead times:
-  lahore_local    →  10 days  (fastest, default for PK fashion items)
-  karachi_trader  →   7 days  (basics/staples, slightly faster)
-  china_import    →  32 days  (accessories, incl. ~5-7 day customs buffer)
+Supplier classification (Node 2, keyword-based, deterministic):
+  china_import   → accessories/bags/shoes/jewelry keywords
+  karachi_trader → basics/plain/staple keywords
+  lahore_local   → default (Pakistani fashion: kurta, suit, lawn, co-ord, etc.)
+  HARD RULE (enforced in code, not just prompted): china_import is never used
+  for urgency="critical" — lead time too long. Falls back to lahore_local.
 
 Chaining:
-  Runs AFTER Inventory Agent (inventory_snapshot)
+  Runs AFTER Inventory Agent (inventory_snapshot, incl. has_pending_restock)
   Runs AFTER Pricing Agent   (pricing_recommendations — used to skip clearance)
-  Supervisor: inventory → pricing → restock → summarize
 
 Standalone test:
   python -m agents.restock.graph
 """
 
 import json
+import math
 import os
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Optional
 import operator
 
@@ -73,7 +73,6 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from agents.skills import load_skill
@@ -83,7 +82,7 @@ from agents.state import (
     PricingRecommendation,
     RestockRecommendation,
 )
-from response_schemas.restock_model import RestockAnalysis
+from response_schemas.restock_model import RestockPlanItem, RestockCopyPlan
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -94,6 +93,37 @@ load_dotenv()
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
 
 model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+
+SAFETY_BUFFER_DAYS = int(os.getenv("RESTOCK_SAFETY_BUFFER_DAYS", "7"))
+MIN_ORDER_QTY       = int(os.getenv("RESTOCK_MIN_ORDER_QTY", "20"))
+MAX_SUPPLY_DAYS     = int(os.getenv("RESTOCK_MAX_SUPPLY_DAYS", "60"))
+
+SUPPLIER_LEAD_DAYS = {
+    "lahore_local":   10,
+    "karachi_trader":  7,
+    "china_import":   32,
+}
+
+_CHINA_IMPORT_KEYWORDS = {
+    "bag", "bags", "shoe", "shoes", "sneaker", "sneakers", "sandal", "sandals",
+    "heel", "heels", "jewelry", "jewellery", "earring", "earrings", "necklace",
+    "bracelet", "watch", "sunglasses", "belt", "clutch", "handbag", "purse",
+    "accessory", "accessories",
+}
+_KARACHI_TRADER_KEYWORDS = {
+    "basic", "basics", "plain", "tee", "t-shirt", "tshirt", "vest",
+    "undershirt", "essential", "essentials", "staple",
+}
+
+# Order matters — first match wins.
+_UNIT_COST_RULES: list[tuple[tuple[str, ...], float]] = [
+    (("khaddar",), 1400.0),
+    (("chiffon", "formal"), 2200.0),
+    (("co-ord", "coord", "co ord"), 1800.0),
+    (("lawn", "cotton"), 900.0),
+    (("cargo", "bottom", "pant", "trouser", "palazzo"), 900.0),
+    (("accessor", "bag", "jewelry", "jewellery", "clutch"), 500.0),
+]
 
 
 # ── Subgraph state ─────────────────────────────────────────────────────────────
@@ -107,12 +137,14 @@ class RestockAgentState(TypedDict):
     inventory_snapshot:      list[InventorySnapshot]
     pricing_recommendations: list[PricingRecommendation]
 
-    # Populated by Node 1 (internal scratch — not in FashionOSState, LangGraph drops on merge)
+    # Node 1 output (internal scratch — LangGraph drops on merge)
     restock_candidates: list[dict]
 
-    # Agent-internal scratch
-    skill_content: str
-    raw_analysis:  str
+    # Node 2 output (deterministic plan — internal scratch)
+    computed_plan: list[dict]
+
+    # LLM scratch
+    raw_copy: str
 
     # Final outputs → merged into parent FashionOSState via operator.add
     restock_recommendations: Annotated[list[RestockRecommendation], operator.add]
@@ -139,26 +171,73 @@ def _parse_mcp_result(raw) -> list | dict:
     return content
 
 
+# ── Helpers: deterministic classification / math ───────────────────────────────
+
+def _classify_supplier_type(product_title: str, variant_title: str, urgency: str) -> str:
+    text = f"{product_title} {variant_title}".lower()
+    supplier = "lahore_local"
+    if any(kw in text for kw in _CHINA_IMPORT_KEYWORDS):
+        supplier = "china_import"
+    elif any(kw in text for kw in _KARACHI_TRADER_KEYWORDS):
+        supplier = "karachi_trader"
+    # Hard rule, enforced here (not just prompted): china_import lead time is
+    # too long for a critical stockout — always fall back to the fastest option.
+    if supplier == "china_import" and urgency == "critical":
+        supplier = "lahore_local"
+    return supplier
+
+
+def _estimate_unit_cost(product_title: str, variant_title: str) -> Optional[float]:
+    text = f"{product_title} {variant_title}".lower()
+    for keywords, cost in _UNIT_COST_RULES:
+        if any(kw in text for kw in keywords):
+            return cost
+    return None
+
+
+def _compute_quantity(units_per_day: float, lead_days: int, current_stock: int) -> int:
+    if units_per_day <= 0:
+        return 0
+    raw = math.ceil(units_per_day * (lead_days + SAFETY_BUFFER_DAYS)) - current_stock
+    if raw <= 0:
+        return 0
+    raw = max(raw, MIN_ORDER_QTY)          # MOQ floor
+    cap = math.ceil(units_per_day * MAX_SUPPLY_DAYS)
+    if cap >= MIN_ORDER_QTY:               # cap only applies above the MOQ
+        raw = min(raw, cap)
+    return raw
+
+
+def _skip_item(c: dict, skip_reason: str, supplier_type: str = "lahore_local", lead_days: int = 0) -> dict:
+    return RestockPlanItem(
+        sku=c["sku"], product_title=c["product_title"], variant_title=c["variant_title"],
+        should_restock=False, skip_reason=skip_reason,
+        recommended_quantity=0, urgency=c["urgency"],
+        days_of_stock_remaining=c["days_of_stock_remaining"], units_per_day=c["units_per_day"],
+        current_stock=c["current_stock"], supplier_type=supplier_type,
+        estimated_lead_days=lead_days, expected_stockout_date="", order_deadline="",
+        is_overdue=False, estimated_unit_cost_pkr=None, estimated_total_cost_pkr=None,
+        priority=999, status="pending_approval",
+    ).model_dump()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 1 — prepare_restock_data
 # ══════════════════════════════════════════════════════════════════════════════
 
 def prepare_restock_data(state: RestockAgentState) -> dict:
     """
-    Reads inventory_snapshot + pricing_recommendations from state.
-    No MCP connection — data is already present from prior agents.
+    Reads inventory_snapshot + pricing_recommendations from state. No MCP call —
+    data is already present from prior agents in this run.
 
-    Filters to restock candidates:
-      - Only "critical" and "high" urgency SKUs (from Inventory Agent)
-      - Annotates each with the pricing action (from Pricing Agent)
-        so the LLM can skip clearance SKUs without extra context
-      - Skips SKUs with zero velocity (dead stock → Pricing Agent handles those)
-
-    The combined payload goes into state.restock_candidates for Node 3 to analyse.
-    This is the composability pattern: two agents' outputs combined in a third
-    without any additional I/O.
+    Filters to critical/high urgency SKUs and annotates each with:
+      - pricing_action (skip if clearance_code)
+      - zero_velocity (skip — dead stock, Pricing Agent handles it)
+      - has_pending_restock / pending_restock_note, straight off the Inventory
+        Agent's snapshot — this is the dedup fix. Inventory already re-checks
+        in-flight restocks against the DB every run; Restock just trusts it
+        instead of duplicating that DB call.
     """
-    # Build pricing lookup by SKU
     pricing_by_sku: dict[str, str] = {
         p["sku"]: p.get("action", "hold")
         for p in state.get("pricing_recommendations", [])
@@ -174,7 +253,7 @@ def prepare_restock_data(state: RestockAgentState) -> dict:
         if urgency not in ("critical", "high"):
             continue
 
-        velocity = snap.get("units_per_day", 0.0)
+        velocity       = snap.get("units_per_day", 0.0)
         pricing_action = pricing_by_sku.get(sku, "hold")
 
         candidates.append({
@@ -186,160 +265,198 @@ def prepare_restock_data(state: RestockAgentState) -> dict:
             "days_of_stock_remaining": snap.get("days_of_stock_remaining", 0.0),
             "urgency":                 urgency,
             "pricing_action":          pricing_action,
-            # Pre-flag for the LLM — clearance = don't restock
             "is_on_clearance":         pricing_action == "clearance_code",
-            # Zero velocity = dead stock — pricing handles it, not us
             "zero_velocity":           velocity == 0.0,
+            "has_pending_restock":     snap.get("has_pending_restock", False),
+            "pending_restock_note":    snap.get("pending_restock_note"),
         })
 
-    n_critical = sum(1 for c in candidates if c["urgency"] == "critical")
-    n_high     = sum(1 for c in candidates if c["urgency"] == "high")
+    n_critical  = sum(1 for c in candidates if c["urgency"] == "critical")
+    n_high      = sum(1 for c in candidates if c["urgency"] == "high")
     n_clearance = sum(1 for c in candidates if c["is_on_clearance"])
+    n_pending   = sum(1 for c in candidates if c["has_pending_restock"])
 
     print(
         f"[Restock] {len(candidates)} candidates "
-        f"({n_critical} critical, {n_high} high, {n_clearance} flagged for clearance)."
+        f"({n_critical} critical, {n_high} high, {n_clearance} clearance, "
+        f"{n_pending} already have a restock in flight)."
     )
 
     return {"restock_candidates": candidates}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 2 — load_domain_skill
+# NODE 2 — compute_restock_plan (deterministic, no LLM)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_domain_skill(state: RestockAgentState) -> dict:
+def compute_restock_plan(state: RestockAgentState) -> dict:
     """
-    Loads the fashion_inventory domain skill.
-
-    This skill contains:
-    - Supplier lead times for Pakistan (Lahore, Karachi, China)
-    - Dead stock thresholds and urgency definitions
-    - Seasonal context (Eid, summer, winter peaks)
-    - Pakistani size distribution patterns
-
-    Loaded here so Node 3's system prompt has full domain context without
-    bloating the base system prompt.
-    """
-    skill = load_skill("fashion_inventory")
-    print("[Restock] Domain skill loaded.")
-    return {"skill_content": skill}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — run_claude_analysis
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def run_claude_analysis(state: RestockAgentState) -> dict:
-    """
-    Single structured LLM call that produces restock decisions for all candidates.
-
-    For each candidate:
-    - Decides whether to restock (skips clearance and zero-velocity SKUs)
-    - Calculates recommended order quantity using the lead-time formula
-    - Selects the appropriate supplier type for the product category
-    - Computes expected stockout date
-    - Generates a WhatsApp-ready supplier message in Urdu-English
-
-    Not a ReAct loop — all data is in state. One structured call is sufficient.
+    should_restock gate, quantity formula, supplier classification, stockout/
+    deadline dates, and cost estimates — all pure Python, all auditable. The
+    LLM never sees these as something to calculate.
     """
     candidates = state.get("restock_candidates", [])
+    today = date.today()
 
-    if not candidates:
-        print("[Restock] No candidates — skipping analysis.")
-        empty = RestockAnalysis(
-            decisions=[],
-            summary="No SKUs require restocking this cycle. All inventory is healthy or managed by pricing.",
+    plan: list[dict] = []
+
+    for c in candidates:
+        # ── should_restock gate, in priority order ──────────────────────────
+        if c["has_pending_restock"]:
+            plan.append(_skip_item(
+                c, c.get("pending_restock_note") or "Restock already in flight for this SKU."
+            ))
+            continue
+
+        if c["is_on_clearance"]:
+            plan.append(_skip_item(
+                c, "Pricing Agent is clearing this stock — restocking would be contradictory."
+            ))
+            continue
+
+        if c["zero_velocity"]:
+            plan.append(_skip_item(
+                c, "Dead stock — zero velocity, no point ordering more."
+            ))
+            continue
+
+        supplier_type = _classify_supplier_type(c["product_title"], c["variant_title"], c["urgency"])
+        lead_days     = SUPPLIER_LEAD_DAYS[supplier_type]
+        quantity      = _compute_quantity(c["units_per_day"], lead_days, c["current_stock"])
+
+        if quantity <= 0:
+            plan.append(_skip_item(
+                c, "Current stock already covers the full lead time plus safety buffer.",
+                supplier_type, lead_days,
+            ))
+            continue
+
+        stockout_date  = today + timedelta(days=max(0, math.floor(c["days_of_stock_remaining"])))
+        order_deadline = stockout_date - timedelta(days=lead_days)
+        is_overdue     = order_deadline < today
+
+        unit_cost  = _estimate_unit_cost(c["product_title"], c["variant_title"])
+        total_cost = (unit_cost * quantity) if unit_cost is not None else None
+
+        item = RestockPlanItem(
+            sku=c["sku"], product_title=c["product_title"], variant_title=c["variant_title"],
+            should_restock=True, skip_reason=None,
+            recommended_quantity=quantity, urgency=c["urgency"],
+            days_of_stock_remaining=c["days_of_stock_remaining"], units_per_day=c["units_per_day"],
+            current_stock=c["current_stock"], supplier_type=supplier_type,
+            estimated_lead_days=lead_days,
+            expected_stockout_date=stockout_date.isoformat(), order_deadline=order_deadline.isoformat(),
+            is_overdue=is_overdue, estimated_unit_cost_pkr=unit_cost, estimated_total_cost_pkr=total_cost,
+            priority=0, status="pending_approval",
         )
-        return {"raw_analysis": empty.model_dump_json()}
+        plan.append(item.model_dump())
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # ── Priority ordering: overdue first, then critical, then by stockout date ──
+    orderable = [p for p in plan if p["should_restock"]]
+    orderable.sort(key=lambda p: (
+        0 if p["is_overdue"] else 1,
+        0 if p["urgency"] == "critical" else 1,
+        p["expected_stockout_date"],
+    ))
+    for i, p in enumerate(orderable):
+        p["priority"] = i + 1
+
+    n_overdue = sum(1 for p in orderable if p["is_overdue"])
+    n_skipped = len(plan) - len(orderable)
+
+    print(
+        f"[Restock] Plan computed: {len(orderable)} to order "
+        f"({n_overdue} overdue), {n_skipped} skipped."
+    )
+
+    return {"computed_plan": plan}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 3 — generate_copy (the ONLY LLM call)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def generate_copy(state: RestockAgentState) -> dict:
+    """
+    Every number is already final. This call writes: per-SKU reason + WhatsApp
+    message, per-supplier consolidated WhatsApp message, and an overall summary.
+    """
+    plan      = state.get("computed_plan", [])
+    orderable = [p for p in plan if p["should_restock"]]
+
+    if not orderable:
+        empty = RestockCopyPlan(
+            items=[], batches=[],
+            summary=(
+                "No SKUs require restocking this cycle. All inventory is healthy, "
+                "on clearance, or already has a restock in flight."
+            ),
+        )
+        return {"raw_copy": empty.model_dump_json()}
+
+    skill_content = load_skill("fashion_inventory")
+
+    by_supplier: dict[str, list[dict]] = defaultdict(list)
+    for p in orderable:
+        by_supplier[p["supplier_type"]].append(p)
+
+    batches_context = [
+        {
+            "supplier_type":       stype,
+            "estimated_lead_days": items[0]["estimated_lead_days"],
+            "skus":                [i["sku"] for i in items],
+            "total_units":         sum(i["recommended_quantity"] for i in items),
+        }
+        for stype, items in by_supplier.items()
+    ]
 
     system_prompt = f"""You are the Restock Agent for {state['brand_name']}, \
 an autonomous AI fashion brand operating system.
 
-{state['skill_content']}
+{skill_content}
 
 ## Your task
-Analyse the restock candidates and decide whether each SKU needs a purchase order.
-Today's date is {today}.
+Every number below — quantity, supplier, dates, cost — is FINAL, computed by \
+deterministic Python logic. Do NOT recompute, second-guess, or contradict any \
+number. Your only job is natural-language content:
 
-## Quantity formula
-recommended_qty = ceil(units_per_day × (lead_time + 7)) - current_stock
-
-Where:
-  lead_time = supplier lead time in days (see supplier types below)
-  7         = safety buffer days (ensures stock on arrival before next stockout)
-  result    = round UP (ceil), then apply floor/cap
-
-Rules:
-  - If result ≤ 0: no restock needed (stock will last through lead time)
-  - If 0 < result < 20: order 20 (minimum MOQ floor)
-  - If result > units_per_day × 60: cap at units_per_day × 60 (no over-ordering)
-
-## Supplier types
-| Type              | Lead days | Use for                                              |
-|-------------------|-----------|------------------------------------------------------|
-| lahore_local      | 10        | Pakistani women's fashion (kurtas, suits, lawn, co-ords, shalwar kameez) |
-| karachi_trader    | 7         | Basics and staples (plain fabric, simple cuts, essentials) |
-| china_import      | 32        | Accessories, bags, shoes, jewelry, novelty items     |
-
-CRITICAL RULE: NEVER recommend china_import for urgency="critical" — lead time is too long.
-Default to lahore_local unless the product is clearly accessories/import-only.
-
-## Decision rules
-
-### should_restock = False when:
-  1. is_on_clearance = True → Pricing Agent is clearing this stock; contradictory to restock
-  2. zero_velocity = True → Dead stock; no point ordering more of something not selling
-  3. Formula result ≤ 0 → Stock covers the full lead time + buffer already
-
-### should_restock = True when:
-  - urgency = "critical" or "high"
-  - is_on_clearance = False
-  - zero_velocity = False
-  - Formula result > 0
-
-## expected_stockout_date
-Compute: {today} + floor(days_of_stock_remaining) days.
-Format: YYYY-MM-DD.
+1. Per SKU: a 1-2 sentence `reason` referencing the given numbers, and an \
+   individual `supplier_message` WhatsApp text in Urdu-English mix.
+2. Per supplier batch: one `consolidated_message` covering every SKU in that \
+   batch — this is what actually gets sent, not the individual per-SKU ones.
+3. A 2-3 sentence overall `summary` — lead with overdue/critical orders, \
+   mention total units, supplier count, estimated spend.
 
 ## Supplier message style
-Write as a Pakistani fashion brand would actually WhatsApp a local supplier:
 - Natural Urdu-English mix (code-switching is normal in Pakistani business)
-- Warm but businesslike — suppliers are partners, not just vendors
-- Be specific: include SKU, product name, exact quantity, urgency, delivery deadline
-- Always request price confirmation (even for known suppliers)
-- Keep under 200 words
+- Warm but businesslike — suppliers are partners, not vendors
+- Be specific: SKU, product name, exact quantity, urgency, delivery deadline
+- Always request price confirmation
+- Individual messages under 150 words, consolidated batch messages under 300 words
 
 ## Output requirement
-Include ALL candidates in decisions — either should_restock=True or False with skip_reason.
-Never omit a candidate from the output.
+Include ALL items below — one entry per SKU, one per supplier batch. Never omit one.
 """
 
     user_msg = (
-        f"Restock candidates for {state['brand_name']} (today: {today}):\n\n"
-        f"```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
-        "Produce restock decisions with supplier messages for all candidates above."
+        f"Restock plan for {state['brand_name']} (today: {date.today().isoformat()}):\n\n"
+        f"### Per-SKU plan\n```json\n{json.dumps(orderable, indent=2)}\n```\n\n"
+        f"### Supplier batches\n```json\n{json.dumps(batches_context, indent=2)}\n```\n\n"
+        "Write the reasons, supplier messages, consolidated batch messages, and summary."
     )
 
-    structured_llm = model.with_structured_output(RestockAnalysis)
-    analysis: RestockAnalysis = await structured_llm.ainvoke([
+    structured_llm = model.with_structured_output(RestockCopyPlan)
+    copy_plan: RestockCopyPlan = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_msg),
     ])
 
-    restock_count  = sum(1 for d in analysis.decisions if d.should_restock)
-    skip_count     = sum(1 for d in analysis.decisions if not d.should_restock)
-    total_units    = sum(d.recommended_quantity for d in analysis.decisions if d.should_restock)
-
     print(
-        f"[Restock] Analysis complete. "
-        f"{restock_count} orders, {skip_count} skipped, "
-        f"{total_units} total units. Summary: {analysis.summary}"
+        f"[Restock] Copy generated for {len(copy_plan.items)} SKUs, "
+        f"{len(copy_plan.batches)} supplier batches. Summary: {copy_plan.summary}"
     )
 
-    return {"raw_analysis": analysis.model_dump_json()}
+    return {"raw_copy": copy_plan.model_dump_json()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -348,31 +465,30 @@ Never omit a candidate from the output.
 
 async def execute_restock_actions(state: RestockAgentState) -> dict:
     """
-    For each should_restock=True decision, calls create_restock_recommendation
-    via shopify-mcp to register the pending order.
-
-    ALL restock recommendations are pending_approval — this agent never
-    auto-orders. Every purchase order requires explicit human approval in
-    the dashboard. This is a deliberate trust boundary (real money).
-
-    Writes to state.restock_recommendations + state.alerts.
-    Critical urgency → "critical" alert. High urgency → "warning" alert.
-    Both levels surface in the dashboard and run summary.
+    Merges the deterministic plan (Node 2) with the LLM copy (Node 3), calls
+    create_restock_recommendation via shopify-mcp for each order, and writes
+    restock_recommendations + alerts. ALL orders are pending_approval — this
+    agent never auto-orders. Overdue or critical orders raise a "critical" alert.
     """
-    analysis = RestockAnalysis.model_validate_json(state["raw_analysis"])
-    now_iso  = datetime.now(timezone.utc).isoformat()
+    plan      = state.get("computed_plan", [])
+    copy_plan = RestockCopyPlan.model_validate_json(state["raw_copy"])
+    now_iso   = datetime.now(timezone.utc).isoformat()
 
-    restock_recommendations: list[RestockRecommendation] = []
-    alerts:                  list[AgentAlert]             = []
+    reason_by_sku  = {i.sku: i.reason for i in copy_plan.items}
+    message_by_sku = {i.sku: i.supplier_message for i in copy_plan.items}
+    consolidated_by_supplier = {b.supplier_type: b.consolidated_message for b in copy_plan.batches}
 
-    orders_to_create = [d for d in analysis.decisions if d.should_restock]
+    orderable = sorted((p for p in plan if p["should_restock"]), key=lambda p: p["priority"])
 
-    if not orders_to_create:
+    for p in plan:
+        if not p["should_restock"]:
+            print(f"[Restock] ◔ Skipped {p['sku']}: {p['skip_reason']}")
+
+    if not orderable:
         print("[Restock] No restock orders to create this cycle.")
         return {"restock_recommendations": [], "alerts": []}
 
-    # ── Open MCP connection ────────────────────────────────────────────────
-    client = MultiServerMCPClient(
+    client   = MultiServerMCPClient(
         {"shopify": {"url": SHOPIFY_MCP_URL, "transport": "streamable_http"}}
     )
     tools    = await client.get_tools()
@@ -381,66 +497,75 @@ async def execute_restock_actions(state: RestockAgentState) -> dict:
     if "create_restock_recommendation" not in tool_map:
         print("[Restock] WARNING: 'create_restock_recommendation' not in tool_map — rebuild Docker image")
 
-    for d in analysis.decisions:
-        if not d.should_restock:
-            print(f"[Restock] ◔ Skipped {d.sku}: {d.skip_reason}")
-            continue
+    restock_recommendations: list[RestockRecommendation] = []
+    alerts:                  list[AgentAlert]             = []
 
-        # ── Call MCP tool ─────────────────────────────────────────────────
+    for p in orderable:
+        sku     = p["sku"]
+        reason  = reason_by_sku.get(
+            sku, f"{p['urgency'].title()} urgency — {p['days_of_stock_remaining']:.1f} days of stock remaining."
+        )
+        message = message_by_sku.get(sku) or consolidated_by_supplier.get(p["supplier_type"], "")
+
         if "create_restock_recommendation" in tool_map:
             try:
                 raw = await tool_map["create_restock_recommendation"].ainvoke({
-                    "sku":                     d.sku,
-                    "recommended_quantity":    d.recommended_quantity,
-                    "urgency":                 d.urgency,
-                    "days_of_stock_remaining": d.days_of_stock_remaining,
-                    "units_per_day":           d.units_per_day,
-                    "reason":                  d.reason,
-                    "supplier_message":        d.supplier_message,
+                    "sku":                     sku,
+                    "recommended_quantity":    p["recommended_quantity"],
+                    "urgency":                 p["urgency"],
+                    "days_of_stock_remaining": p["days_of_stock_remaining"],
+                    "units_per_day":           p["units_per_day"],
+                    "reason":                  reason,
+                    "supplier_message":        message,
                     "brand_id": state["brand_id"],
                 })
-                _parse_mcp_result(raw)  # validate parseable; result not used directly
+                _parse_mcp_result(raw)
             except Exception as exc:
-                # Non-fatal — we still write to state even if MCP call fails
-                print(f"[Restock] ⚠ MCP call failed for {d.sku}: {exc}")
+                print(f"[Restock] ⚠ MCP call failed for {sku}: {exc}")
 
-        # ── Build typed RestockRecommendation ─────────────────────────────
         rec = RestockRecommendation(
-            sku                     = d.sku,
-            recommended_quantity    = d.recommended_quantity,
-            urgency                 = d.urgency,
-            days_of_stock_remaining = d.days_of_stock_remaining,
-            units_per_day           = d.units_per_day,
-            reason                  = d.reason,
-            supplier_message        = d.supplier_message,
-            status                  = "pending_approval",
+            sku                      = sku,
+            recommended_quantity     = p["recommended_quantity"],
+            urgency                  = p["urgency"],
+            days_of_stock_remaining  = p["days_of_stock_remaining"],
+            units_per_day            = p["units_per_day"],
+            reason                   = reason,
+            supplier_message         = message,
+            status                   = "pending_approval",
+            supplier_type            = p["supplier_type"],
+            estimated_lead_days      = p["estimated_lead_days"],
+            expected_stockout_date   = p["expected_stockout_date"],
+            order_deadline           = p["order_deadline"],
+            is_overdue               = p["is_overdue"],
+            estimated_unit_cost_pkr  = p["estimated_unit_cost_pkr"],
+            estimated_total_cost_pkr = p["estimated_total_cost_pkr"],
+            priority                 = p["priority"],
         )
         restock_recommendations.append(rec)
 
-        # ── Raise alert ───────────────────────────────────────────────────
-        alert_level = "critical" if d.urgency == "critical" else "warning"
+        alert_level = "critical" if (p["urgency"] == "critical" or p["is_overdue"]) else "warning"
+        overdue_tag = " [OVERDUE]" if p["is_overdue"] else ""
         alerts.append(AgentAlert(
             level      = alert_level,
             agent      = "restock_agent",
             message    = (
-                f"RESTOCK PENDING APPROVAL: {d.sku} "
-                f"({d.product_title} / {d.variant_title}). "
-                f"{d.days_of_stock_remaining:.1f} days remaining at "
-                f"{d.units_per_day:.1f} units/day. "
-                f"Order {d.recommended_quantity} units via {d.supplier_type} "
-                f"({d.estimated_lead_days}d lead). "
-                f"Stockout: {d.expected_stockout_date}."
+                f"RESTOCK PENDING APPROVAL{overdue_tag}: {sku} "
+                f"({p['product_title']} / {p['variant_title']}). "
+                f"{p['days_of_stock_remaining']:.1f} days remaining. "
+                f"Order {p['recommended_quantity']} units via {p['supplier_type']} "
+                f"({p['estimated_lead_days']}d lead). "
+                f"Stockout: {p['expected_stockout_date']}. Order deadline: {p['order_deadline']}."
             ),
-            sku        = d.sku,
+            sku        = sku,
             created_at = now_iso,
         ))
 
         print(
-            f"[Restock] 🗸 Queued {d.sku}: "
-            f"{d.recommended_quantity} units | "
-            f"{d.urgency.upper()} | "
-            f"{d.supplier_type} ({d.estimated_lead_days}d) | "
-            f"stockout {d.expected_stockout_date}"
+            f"[Restock] 🗸 Queued #{p['priority']} {sku}: "
+            f"{p['recommended_quantity']} units | {p['urgency'].upper()}"
+            f"{' | OVERDUE' if p['is_overdue'] else ''} | "
+            f"{p['supplier_type']} ({p['estimated_lead_days']}d) | "
+            f"stockout {p['expected_stockout_date']}"
         )
 
     print(
@@ -459,24 +584,17 @@ async def execute_restock_actions(state: RestockAgentState) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_restock_graph() -> StateGraph:
-    """
-    Assembles and compiles the Restock Agent subgraph.
-
-    Returns a compiled LangGraph usable two ways:
-    1. Standalone test:  await restock_graph.ainvoke(initial_state)
-    2. Inside supervisor: run_restock_agent() calls it after Pricing Agent
-    """
     graph = StateGraph(RestockAgentState)
 
     graph.add_node("prepare_restock_data",    prepare_restock_data)
-    graph.add_node("load_domain_skill",       load_domain_skill)
-    graph.add_node("run_claude_analysis",     run_claude_analysis)
+    graph.add_node("compute_restock_plan",    compute_restock_plan)
+    graph.add_node("generate_copy",           generate_copy)
     graph.add_node("execute_restock_actions", execute_restock_actions)
 
     graph.add_edge(START,                      "prepare_restock_data")
-    graph.add_edge("prepare_restock_data",     "load_domain_skill")
-    graph.add_edge("load_domain_skill",        "run_claude_analysis")
-    graph.add_edge("run_claude_analysis",      "execute_restock_actions")
+    graph.add_edge("prepare_restock_data",     "compute_restock_plan")
+    graph.add_edge("compute_restock_plan",     "generate_copy")
+    graph.add_edge("generate_copy",            "execute_restock_actions")
     graph.add_edge("execute_restock_actions",  END)
 
     return graph.compile()
@@ -488,115 +606,79 @@ restock_graph = build_restock_graph()
 # ══════════════════════════════════════════════════════════════════════════════
 # Standalone test runner
 # python -m agents.restock.graph
-# (uses mock inventory + pricing state — no live Shopify data needed for Node 1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import asyncio
-    from dotenv import load_dotenv
-    load_dotenv()
 
     async def _test_run():
         print("\n" + "═" * 60)
         print("  FashionOS — Restock Agent Test Run")
         print("═" * 60 + "\n")
 
-        # Simulate Inventory Agent + Pricing Agent having already run
         mock_inventory: list[InventorySnapshot] = [
             {
-                "sku":                     "FOS-001-S",
-                "product_title":           "Olive Cargo Pants",
-                "variant_title":           "Small",
-                "current_stock":           8,
-                "units_per_day":           1.8,
-                "days_of_stock_remaining": 4.4,
-                "urgency":                 "critical",
+                "sku": "FOS-001-S", "product_title": "Olive Cargo Pants", "variant_title": "Small",
+                "current_stock": 8, "units_per_day": 1.8, "days_of_stock_remaining": 4.4,
+                "urgency": "critical", "has_pending_restock": False, "pending_restock_note": None,
             },
             {
-                "sku":                     "FOS-001-M",
-                "product_title":           "Olive Cargo Pants",
-                "variant_title":           "Medium",
-                "current_stock":           15,
-                "units_per_day":           1.2,
-                "days_of_stock_remaining": 12.5,
-                "urgency":                 "high",
+                "sku": "FOS-001-M", "product_title": "Olive Cargo Pants", "variant_title": "Medium",
+                "current_stock": 15, "units_per_day": 1.2, "days_of_stock_remaining": 12.5,
+                "urgency": "high", "has_pending_restock": False, "pending_restock_note": None,
             },
             {
-                "sku":                     "FOS-002-S",
-                "product_title":           "Beige Linen Kurta",
-                "variant_title":           "Small",
-                "current_stock":           40,
-                "units_per_day":           0.0,
-                "days_of_stock_remaining": 999.0,
-                "urgency":                 "normal",   # healthy — should not appear in candidates
+                "sku": "FOS-003-M", "product_title": "Pink Chiffon Dupatta", "variant_title": "Free Size",
+                "current_stock": 5, "units_per_day": 0.0, "days_of_stock_remaining": 999.0,
+                "urgency": "high", "has_pending_restock": False, "pending_restock_note": None,
             },
+            # Demonstrates the dedup fix — critical urgency but already has a PO in flight.
             {
-                "sku":                     "FOS-003-M",
-                "product_title":           "Pink Chiffon Dupatta",
-                "variant_title":           "Free Size",
-                "current_stock":           5,
-                "units_per_day":           0.0,
-                "days_of_stock_remaining": 999.0,
-                "urgency":                 "high",     # high urgency but zero velocity + clearance
+                "sku": "FOS-004-L", "product_title": "Beige Linen Co-ord Set", "variant_title": "Large",
+                "current_stock": 3, "units_per_day": 1.5, "days_of_stock_remaining": 2.0,
+                "urgency": "critical", "has_pending_restock": True,
+                "pending_restock_note": "Restock already approved (40 units) — no new PO needed.",
             },
         ]
 
         mock_pricing: list[PricingRecommendation] = [
             {
-                "sku":               "FOS-001-S",
-                "variant_id":        123456,
-                "current_price":     2999.0,
-                "recommended_price": 2999.0,
-                "action":            "hold",
-                "discount_pct":      0.0,
-                "reason":            "High velocity — hold price.",
+                "sku": "FOS-001-S", "variant_id": 123456, "current_price": 2999.0,
+                "recommended_price": 2999.0, "action": "hold", "discount_pct": 0.0,
+                "reason": "High velocity — hold price.",
             },
             {
-                "sku":               "FOS-001-M",
-                "variant_id":        123457,
-                "current_price":     2999.0,
-                "recommended_price": 2999.0,
-                "action":            "hold",
-                "discount_pct":      0.0,
-                "reason":            "Selling well — hold.",
-            },
-            {
-                "sku":               "FOS-003-M",
-                "variant_id":        123458,
-                "current_price":     1499.0,
-                "recommended_price": 899.0,
-                "action":            "clearance_code",
-                "discount_pct":      40.0,
-                "reason":            "Dead stock 60+ days — clearance.",
+                "sku": "FOS-003-M", "variant_id": 123458, "current_price": 1499.0,
+                "recommended_price": 899.0, "action": "clearance_code", "discount_pct": 40.0,
+                "reason": "Dead stock 60+ days — clearance.",
             },
         ]
 
         initial_state: RestockAgentState = {
-            "brand_id":               os.getenv("BRAND_ID", "test-brand-001"),
-            "brand_name":             os.getenv("BRAND_NAME", "TestBrand"),
-            "inventory_snapshot":     mock_inventory,
-            "pricing_recommendations":mock_pricing,
-            "restock_candidates":     [],
-            "skill_content":          "",
-            "raw_analysis":           "",
-            "restock_recommendations":[],
-            "alerts":                 [],
+            "brand_id":                 os.getenv("BRAND_ID", "test-brand-001"),
+            "brand_name":               os.getenv("BRAND_NAME", "TestBrand"),
+            "inventory_snapshot":       mock_inventory,
+            "pricing_recommendations":  mock_pricing,
+            "restock_candidates":       [],
+            "computed_plan":            [],
+            "raw_copy":                 "",
+            "restock_recommendations":  [],
+            "alerts":                   [],
         }
 
         result = await restock_graph.ainvoke(initial_state)
 
-        print("\n── RESTOCK ORDERS ─────────────────────────────────────────────")
-        if result["restock_recommendations"]:
-            for rec in result["restock_recommendations"]:
+        print("\n── RESTOCK PLAN (all candidates) ────────────────────────────")
+        for p in result["computed_plan"]:
+            if p["should_restock"]:
                 print(
-                    f"  {rec['sku']:<20} "
-                    f"{rec['urgency'].upper():<10} "
-                    f"Order {rec['recommended_quantity']:>4} units  "
-                    f"({rec['days_of_stock_remaining']:.1f} days remaining)"
+                    f"  ✓ #{p['priority']} {p['sku']:<12} {p['urgency'].upper():<10} "
+                    f"order {p['recommended_quantity']:>4} via {p['supplier_type']:<14} "
+                    f"({p['estimated_lead_days']}d) stockout {p['expected_stockout_date']} "
+                    f"deadline {p['order_deadline']}{' OVERDUE' if p['is_overdue'] else ''}"
                 )
-                print(f"    Reason: {rec['reason']}")
-        else:
-            print("  No restock orders this cycle.")
+            else:
+                print(f"  ✗ {p['sku']:<12} skipped — {p['skip_reason']}")
 
         print("\n── SUPPLIER MESSAGES ──────────────────────────────────────────")
         for rec in result["restock_recommendations"]:

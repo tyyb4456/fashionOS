@@ -63,6 +63,16 @@ class RestockRecommendation(TypedDict):
     supplier_message:         str
     status:                   str  # "pending_approval" | "approved" | "ordered"
 
+    # NEW — deterministic restock intelligence
+    supplier_type:            str      # "lahore_local" | "karachi_trader" | "china_import"
+    estimated_lead_days:      int
+    expected_stockout_date:   str      # ISO date
+    order_deadline:           str      # ISO date — latest date the PO can be placed without a gap
+    is_overdue:                bool
+    estimated_unit_cost_pkr:   Optional[float]
+    estimated_total_cost_pkr:  Optional[float]
+    priority:                  int     # 1 = highest, assigned after sort (overdue → critical → stockout date)
+
 
 class MarketingAction(TypedDict):
     """

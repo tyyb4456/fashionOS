@@ -21,10 +21,10 @@ Session 6 additions:
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, JSON, String, Text, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, Integer, JSON, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -193,6 +193,16 @@ class RestockRecommendationRecord(Base):
     supplier_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending_approval")
+
+    # NEW — deterministic restock intelligence
+    supplier_type:            Mapped[str]             = mapped_column(String(30), nullable=False, default="lahore_local")
+    estimated_lead_days:      Mapped[int]              = mapped_column(Integer, nullable=False, default=0)
+    expected_stockout_date:   Mapped[Optional[date]]   = mapped_column(Date, nullable=True)
+    order_deadline:           Mapped[Optional[date]]   = mapped_column(Date, nullable=True)
+    is_overdue:                Mapped[bool]             = mapped_column(Boolean, nullable=False, default=False)
+    estimated_unit_cost_pkr:   Mapped[Optional[float]]  = mapped_column(Float, nullable=True)
+    estimated_total_cost_pkr:  Mapped[Optional[float]]  = mapped_column(Float, nullable=True)
+    priority:                  Mapped[int]              = mapped_column(Integer, nullable=False, default=0)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -17,7 +17,7 @@ Session 8 additions (multi-tenancy hardening):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from sqlalchemy import desc, select
@@ -162,16 +162,24 @@ async def save_run(
     # ── 5. Restock recommendations ────────────────────────────────────────────
     for rec in state.get("restock_recommendations", []):
         session.add(RestockRecommendationRecord(
-            run_id                  = run_id,
-            brand_id                = summary["brand_id"],
-            sku                     = rec.get("sku", ""),
-            recommended_quantity    = rec.get("recommended_quantity", 0),
-            urgency                 = rec.get("urgency", "normal"),
-            days_of_stock_remaining = rec.get("days_of_stock_remaining", 0.0),
-            units_per_day           = rec.get("units_per_day", 0.0),
-            reason                  = rec.get("reason", ""),
-            supplier_message        = rec.get("supplier_message", ""),
-            status                  = rec.get("status", "pending_approval"),
+            run_id                    = run_id,
+            brand_id                  = summary["brand_id"],
+            sku                       = rec.get("sku", ""),
+            recommended_quantity      = rec.get("recommended_quantity", 0),
+            urgency                   = rec.get("urgency", "normal"),
+            days_of_stock_remaining   = rec.get("days_of_stock_remaining", 0.0),
+            units_per_day             = rec.get("units_per_day", 0.0),
+            reason                    = rec.get("reason", ""),
+            supplier_message          = rec.get("supplier_message", ""),
+            status                    = rec.get("status", "pending_approval"),
+            supplier_type             = rec.get("supplier_type", "lahore_local"),
+            estimated_lead_days       = rec.get("estimated_lead_days", 0),
+            expected_stockout_date    = _parse_date(rec.get("expected_stockout_date")),
+            order_deadline            = _parse_date(rec.get("order_deadline")),
+            is_overdue                = rec.get("is_overdue", False),
+            estimated_unit_cost_pkr   = rec.get("estimated_unit_cost_pkr"),
+            estimated_total_cost_pkr  = rec.get("estimated_total_cost_pkr"),
+            priority                  = rec.get("priority", 0),
         ))
 
     # ── 6. Marketing actions ──────────────────────────────────────────────────
@@ -347,7 +355,7 @@ async def get_pending_restocks(
             RestockRecommendationRecord.brand_id == brand_id,
             RestockRecommendationRecord.status   == "pending_approval",
         )
-        .order_by(RestockRecommendationRecord.days_of_stock_remaining)
+        .order_by(RestockRecommendationRecord.priority, RestockRecommendationRecord.days_of_stock_remaining)
     )
     return list(result.scalars().all())
 
@@ -491,6 +499,14 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
+    except (ValueError, TypeError):
+        return None
+    
+def _parse_date(value: Optional[str]) -> Optional["date"]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
     except (ValueError, TypeError):
         return None
 

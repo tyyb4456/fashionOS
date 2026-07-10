@@ -177,12 +177,12 @@ async def run_restock_agent(state: FashionOSState) -> dict:
         return {}
     print("[Supervisor] → Restock Agent…")
     result = await restock_graph.ainvoke({
-        "brand_id": state["brand_id"], "brand_name": state["brand_name"],
-        "inventory_snapshot": state.get("inventory_snapshot", []),
-        "pricing_recommendations": state.get("pricing_recommendations", []),
-        "restock_candidates": [], "skill_content": "", "raw_analysis": "",
-        "restock_recommendations": [], "alerts": [],
-    })
+            "brand_id": state["brand_id"], "brand_name": state["brand_name"],
+            "inventory_snapshot": state.get("inventory_snapshot", []),
+            "pricing_recommendations": state.get("pricing_recommendations", []),
+            "restock_candidates": [], "computed_plan": [], "raw_copy": "",
+            "restock_recommendations": [], "alerts": [],
+        })
     print(f"[Supervisor] ✓ Restock: {len(result['restock_recommendations'])} orders, {len(result['alerts'])} alerts.")
     return {
         "restock_recommendations": result["restock_recommendations"],

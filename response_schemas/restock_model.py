@@ -131,3 +131,64 @@ class RestockAnalysis(BaseModel):
             "1 SKU skipped — Pricing Agent has it on clearance.'"
         )
     )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Deterministic-math rewrite additions
+# Node 2 (compute_restock_plan) computes RestockPlanItem entirely in Python.
+# Node 3 (generate_copy) is the ONLY LLM call — it only writes RestockCopyOut /
+# SupplierBatchCopyOut / summary text on top of numbers that are already final.
+# The three classes above (RestockDecisionOut, SupplierBatch, RestockAnalysis)
+# are kept as-is for backward compat with anything else importing this module.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RestockPlanItem(BaseModel):
+    """Deterministically computed by agents/restock/graph.py::compute_restock_plan. No LLM involved."""
+    sku:           str
+    product_title: str
+    variant_title: str
+
+    should_restock: bool
+    skip_reason:    Optional[str] = None
+
+    recommended_quantity:    int = Field(ge=0)
+    urgency:                  str
+    days_of_stock_remaining:  float
+    units_per_day:             float
+    current_stock:              int
+
+    supplier_type:          str   # "lahore_local" | "karachi_trader" | "china_import"
+    estimated_lead_days:     int
+    expected_stockout_date:  str  # ISO date, "" if should_restock=False
+    order_deadline:           str  # ISO date, "" if should_restock=False
+    is_overdue:                bool = False
+
+    estimated_unit_cost_pkr:  Optional[float] = None
+    estimated_total_cost_pkr: Optional[float] = None
+
+    priority: int = 999   # 1 = highest, reassigned after sort; 999 = not ordered
+    status:   str = "pending_approval"
+
+
+class RestockCopyOut(BaseModel):
+    """LLM-authored natural language for one SKU. Every number is already final —
+    reference it, never recompute or contradict it."""
+    sku:              str
+    reason:           str = Field(description="1-2 sentences explaining the decision using the given numbers.")
+    supplier_message: str = Field(description="Individual SKU-level WhatsApp message, Urdu-English mix, under 150 words.")
+
+
+class SupplierBatchCopyOut(BaseModel):
+    supplier_type:        str
+    consolidated_message: str = Field(description="One WhatsApp message covering every SKU for this supplier, Urdu-English mix, under 300 words.")
+
+
+class RestockCopyPlan(BaseModel):
+    """The ONLY structured LLM output for the Restock Agent."""
+    items:   list[RestockCopyOut]
+    batches: list[SupplierBatchCopyOut]
+    summary: str = Field(
+        description=(
+            "2-3 sentences. Lead with overdue or critical orders. Mention total "
+            "units, supplier count, estimated spend."
+        )
+    )
