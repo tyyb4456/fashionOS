@@ -240,6 +240,8 @@ async def save_run(
             severity             = insight.get("severity", "info"),
             recommended_fix      = insight.get("recommended_fix", ""),
             fix_type             = insight.get("fix_type", "monitor"),
+            reason_breakdown     = insight.get("reason_breakdown"),
+            evidence             = insight.get("evidence"),
         ))
 
     logger.info(

@@ -189,6 +189,10 @@ class ReturnInsightSchema(_Base):
     severity:             str    # "critical" | "warning" | "info"
     recommended_fix:      str
     fix_type:             str
+
+    # NEW
+    reason_breakdown: Optional[dict[str, int]] = None
+    evidence:          Optional[str] = None
     created_at:           datetime
 
 

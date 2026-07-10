@@ -148,10 +148,6 @@ class PricingActionRecord(Base):
 
     # NEW — deterministic pricing intelligence
     trigger:                  Mapped[str]              = mapped_column(String(50), nullable=False, default="healthy")
-    # NEW — deterministic marketing intelligence
-    roas_7d:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    spend_7d_pkr:  Mapped[float]           = mapped_column(Float, nullable=False, default=0.0)
-    ctr_7d:         Mapped[float]           = mapped_column(Float, nullable=False, default=0.0)
     markdown_rung:             Mapped[int]               = mapped_column(Integer, nullable=False, default=0)
     estimated_unit_cost_pkr:    Mapped[Optional[float]]   = mapped_column(Float, nullable=True)
     estimated_margin_pct:       Mapped[Optional[float]]   = mapped_column(Float, nullable=True)
@@ -255,6 +251,10 @@ class MarketingActionRecord(Base):
     # What triggered the decision
     # "out_of_stock" | "clearance" | "trending" | "organic_viral" | "low_roas" | "healthy" | "no_sku_match"
     trigger: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # NEW — deterministic marketing intelligence
+    roas_7d:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    spend_7d_pkr:  Mapped[float]           = mapped_column(Float, nullable=False, default=0.0)
+    ctr_7d:         Mapped[float]           = mapped_column(Float, nullable=False, default=0.0)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -343,6 +343,10 @@ class ReturnInsightRecord(Base):
     # "update_size_guide" | "update_photos" | "update_description" |
     # "quality_review" | "contact_supplier" | "monitor" | "no_action"
     fix_type:        Mapped[str]           = mapped_column(String(100), nullable=False, default="monitor")
+
+    # NEW — was computed before but silently dropped before persistence
+    reason_breakdown: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)  # dict[str, int]
+    evidence:          Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -221,7 +221,8 @@ async def run_returns_agent(state: FashionOSState) -> dict:
     result = await returns_graph.ainvoke({
         "brand_id": state["brand_id"], "brand_name": state["brand_name"],
         "inventory_snapshot": state.get("inventory_snapshot", []),
-        "raw_returns": [], "returns_by_sku": [], "skill_content": "", "raw_analysis": "",
+        "raw_returns": [], "returns_by_sku": [], "raw_classifications": "",
+        "computed_plan": [], "raw_copy": "",
         "alerts": [], "return_insights": [],
     })
     print(f"[Supervisor] ✓ Returns: {len(result['alerts'])} alerts, {len(result.get('return_insights', []))} insights.")

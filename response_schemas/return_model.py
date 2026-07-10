@@ -93,5 +93,76 @@ class ReturnsAnalysis(BaseModel):
         )
     )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Deterministic-math rewrite additions
+# Node 2 (compute_return_plan) computes ReturnPlanItem entirely in Python —
+# reason classification (keyword taxonomy from the fashion_returns skill),
+# return-rate math, severity thresholds, fix_type mapping, and the
+# recommended_fix template are all deterministic. Node 3 (generate_return_copy)
+# is the ONLY LLM call — it only writes `evidence` (a paraphrase of raw
+# customer text, never verbatim) and a summary. ReturnPattern/ReturnsAnalysis
+# above are kept for backward compat.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ReturnPlanItem(BaseModel):
+    """Deterministically computed by agents/returns/graph.py::compute_return_plan. No LLM involved."""
+    sku:           str
+    product_title: str
+
+    total_returns:        int = Field(ge=0)
+    total_units_returned: int = Field(ge=0)
+
+    primary_reason:   str            # size_issue | description_mismatch | quality_issue |
+                                       # changed_mind | late_delivery | duplicate_order | other
+    reason_breakdown: dict[str, int]  # count per category
+
+    return_rate_pct:     Optional[float] = None
+    estimated_30d_sales: Optional[int]   = None
+
+    severity: str   # "critical" | "warning" | "info" — "healthy" rows never make it into the plan
+
+    fix_type:         str   # deterministic mapping from primary_reason
+    recommended_fix:  str   # deterministic template, product name + count interpolated
+
+    sample_reasons: list[str] = Field(
+        default_factory=list,
+        description="Up to 5 raw customer reason strings for this SKU — context for the LLM's evidence paraphrase only.",
+    )
 
 
+class ReasonClassificationItem(BaseModel):
+    """One LLM classification for one raw customer reason string. Node 2 output — flat list, unaggregated."""
+    sku:          str
+    reason_index: int = Field(description="0-based index into that SKU's raw reason list — used to match back to the source text in Python.")
+    category:     str = Field(description="Exactly one of: size_issue | description_mismatch | quality_issue | changed_mind | late_delivery | duplicate_order | other")
+
+
+class ReasonClassificationBatch(BaseModel):
+    """The ONLY structured output of Node 2 (classify_return_reasons)."""
+    classifications: list[ReasonClassificationItem]
+
+
+class ReturnCopyOut(BaseModel):
+    """LLM-authored evidence + recommended_fix for one flagged SKU (Node 4).
+    primary_reason, severity, fix_type, rate — all already final. Reference them, never contradict."""
+    sku:              str
+    evidence:          str = Field(description="1 sentence paraphrasing the pattern in sample_reasons. Never quote verbatim.")
+    recommended_fix:   str = Field(
+        description=(
+            "Specific, actionable 1-2 sentence fix referencing the actual product, "
+            "primary_reason, and return count. Not generic."
+        )
+    )
+
+
+class ReturnCopyPlan(BaseModel):
+    """The ONLY structured LLM output for the Returns Agent."""
+    items:   list[ReturnCopyOut]
+    summary: str = Field(
+        description=(
+            "2-3 sentence operational summary. Example: '18 returns analyzed across "
+            "4 SKUs in the last 30 days. FOS-002 has a 22% return rate — size guide "
+            "update is critical. FOS-001 returns are all changed_mind post-Eid — no "
+            "product fix needed.'"
+        )
+    )
