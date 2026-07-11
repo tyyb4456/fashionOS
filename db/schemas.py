@@ -188,12 +188,38 @@ class ReturnInsightSchema(_Base):
     estimated_30d_sales:  Optional[int]
     severity:             str    # "critical" | "warning" | "info"
     recommended_fix:      str
-    fix_type:             str
+    fix_type:              str
 
     # NEW
     reason_breakdown: Optional[dict[str, int]] = None
     evidence:          Optional[str] = None
     created_at:           datetime
+
+
+class DMReplySchema(_Base):
+    """
+    One processed DM per run. status: "auto_sent" | "send_failed" |
+    "flagged_open" | "flagged_resolved". Spam is never persisted.
+    """
+    id:                UUID
+    run_id:             str
+    brand_id:           str
+    message_id:         str
+    conversation_id:    str
+    user_id:            str
+    username:           str
+    original_message:   str
+    category:           str
+    auto_send:          bool
+    flag_for_human:     bool
+    flag_priority:      Optional[str]
+    flag_reason:        Optional[str]
+    reply_text:         Optional[str]
+    auto_sent:          bool
+    sent_at:            Optional[datetime]
+    status:             str
+    created_at:         datetime
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,6 +249,9 @@ class RunSummarySchema(_Base):
     marketing_decisions_total:  int = 0
     marketing_auto_executed:    int = 0
     marketing_pending_approval: int = 0
+    # DM
+    dm_auto_replied: int = 0
+    dm_flagged_open: int = 0
     created_at:              datetime
 
 
@@ -236,6 +265,7 @@ class RunDetailSchema(RunSummarySchema):
     marketing_actions:    list[MarketingActionSchema]   = []   # NEW
     content_posts:        list[ContentPostSchema]       = []   # NEW
     return_insights:      list[ReturnInsightSchema]     = []   # NEW
+    dm_replies:            list[DMReplySchema]           = []   # NEW
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -267,6 +297,7 @@ class DashboardSummarySchema(BaseModel):
     pending_marketing_actions: int = 0
     pending_content_posts:     int = 0
     open_return_insights:      int = 0
+    open_flagged_dms:          int = 0
     seasonal_context:          SeasonalContextSchema   # NEW
     recent_runs:                list[RunSummarySchema] = []
     critical_alerts:            list[AlertSchema]      = []

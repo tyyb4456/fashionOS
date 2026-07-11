@@ -261,11 +261,11 @@ async def run_dm_agent(state: FashionOSState) -> dict:
     result = await dm_graph.ainvoke({
         "brand_id": state["brand_id"], "brand_name": state["brand_name"],
         "inventory_snapshot": state.get("inventory_snapshot", []),
-        "raw_dms": [], "skill_content": "", "raw_analysis": "",
+        "raw_dms": [], "raw_classifications": "", "computed_gating": [], "raw_copy": "",
         "dm_replies": [], "alerts": [],
     })
     auto_sent = sum(1 for r in result["dm_replies"] if r.get("auto_sent"))
-    flagged   = sum(1 for r in result["dm_replies"] if r.get("flagged"))
+    flagged   = sum(1 for r in result["dm_replies"] if r.get("flag_for_human"))
     print(f"[Supervisor] ✓ DM: {auto_sent} auto-replied, {flagged} flagged.")
     return {
         "dm_replies":       result["dm_replies"],
@@ -305,7 +305,7 @@ async def summarize(state: FashionOSState) -> dict:
         "campaigns_paused":      [m["sku"] for m in marketing if m.get("action") == "pause" and m.get("sku")],
         "budget_increases_pending": len([m for m in marketing if m.get("action") == "increase_budget"]),
         "dm_auto_replied":       sum(1 for r in dm_replies if r.get("auto_sent")),
-        "dm_high_flagged":       [r.get("username") for r in dm_replies if r.get("flagged") and r.get("category") in ("bulk_inquiry", "complaint")],
+        "dm_high_flagged":       [r.get("username") for r in dm_replies if r.get("flag_for_human") and r.get("category") in ("bulk_inquiry", "complaint")],
         "critical_alerts":       len([a for a in alerts if a.get("level") == "critical"]),
         "warning_alerts":        len([a for a in alerts if a.get("level") == "warning"]),
     }
@@ -372,7 +372,7 @@ async def send_notifications(state: FashionOSState) -> dict:
     dm_replies = state.get("dm_replies", [])
 
     critical      = [a for a in alerts if a.get("level") == "critical"]
-    dm_high_flags = [r for r in dm_replies if r.get("flagged") and r.get("category") in ("bulk_inquiry", "complaint")]
+    dm_high_flags = [r for r in dm_replies if r.get("flag_for_human") and r.get("category") in ("bulk_inquiry", "complaint")]
 
     # ── 1. Critical alerts → WhatsApp ─────────────────────────────────────────
     if critical and "send_critical_alert" in tool_map:

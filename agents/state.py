@@ -121,6 +121,33 @@ class ReturnInsightData(TypedDict):
     fix_type:              str   # "update_size_guide" | "update_photos" | etc.
 
 
+class DMReply(TypedDict):
+    """
+    One processed DM per run — written by the DM Agent. Classification (LLM,
+    Node 2) and gating (Python fixed lookup, Node 3) are computed separately;
+    this is the merged final record persisted to the dm_replies table.
+    """
+    message_id:       str
+    conversation_id:  str
+    user_id:          str
+    username:         str
+    original_message: str  # truncated to 200 chars
+
+    category: str   # "size_question" | "availability" | "order_status" | "general_inquiry" |
+                     # "bulk_inquiry" | "complaint" | "influencer" | "spam"
+
+    auto_send:      bool
+    flag_for_human: bool
+    flag_priority:  Optional[str]   # "high" | "normal" | None
+    flag_reason:    Optional[str]
+
+    reply_text: Optional[str]
+    auto_sent:  bool
+    sent_at:    Optional[str]
+
+    status: str   # "auto_sent" | "send_failed" | "flagged_open" | "flagged_resolved"
+
+
 class AgentAlert(TypedDict):
     level:      str    # "critical" | "warning" | "info"
     agent:      str    # which agent raised this
@@ -157,7 +184,7 @@ class FashionOSState(TypedDict):
     restock_recommendations:    Annotated[list[RestockRecommendation], operator.add]
     marketing_actions:          Annotated[list[MarketingAction], operator.add]
     content_queue:              Annotated[list[dict], operator.add]  # Posts to schedule
-    dm_replies:                 Annotated[list[dict], operator.add]  # Auto-replies sent
+    dm_replies:                 Annotated[list[DMReply], operator.add]  # Auto-replies + flagged DMs
     alerts:                     Annotated[list[AgentAlert], operator.add]
 
     # ── Returns structured output (session 6 — alongside alerts) ──────────────

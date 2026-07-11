@@ -155,10 +155,10 @@ def run_agent_pipeline(
             auto_marketing    = [m for m in marketing if m.get("auto_executed")]
             pending_marketing = [m for m in marketing if not m.get("auto_executed") and m.get("action") not in ("hold",)]
 
-            # DM stats (NEW session 7)
+            # DM stats
             dm_replies    = result.get("dm_replies", [])
             dm_auto_sent  = [r for r in dm_replies if r.get("auto_sent")]
-            dm_flagged    = [r for r in dm_replies if r.get("flagged")]
+            dm_flagged    = [r for r in dm_replies if r.get("flag_for_human")]
 
             summary = {
                 "run_id":           result.get("run_id", initial_state["run_id"]),
@@ -185,7 +185,7 @@ def run_agent_pipeline(
                     "auto_executed":    len(auto_marketing),
                     "pending_approval": len(pending_marketing),
                 },
-                # DM stats — not persisted to DB yet (session 8)
+                # DM stats — persisted to dm_replies table + agent_runs cached columns
                 "dm": {
                     "auto_replied": len(dm_auto_sent),
                     "flagged":      len(dm_flagged),

@@ -78,6 +78,10 @@ class AgentRun(Base):
     marketing_auto_executed:    Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     marketing_pending_approval: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # DM cached counts
+    dm_auto_replied: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dm_flagged_open: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -347,6 +351,49 @@ class ReturnInsightRecord(Base):
     # NEW — was computed before but silently dropped before persistence
     reason_breakdown: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)  # dict[str, int]
     evidence:          Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# dm_replies  — persists DM Agent classification + gating + reply per run
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DMReplyRecord(Base):
+    """
+    One row per processed DM per run (spam is not persisted — noise reduction,
+    same pattern as healthy SKUs in return_insights).
+
+    status: "auto_sent" | "send_failed" | "flagged_open" | "flagged_resolved"
+    flagged_open -> flagged_resolved transition happens via the dashboard's
+    "Mark Resolved" button (api/routers/approvals.py::resolve_dm) — no
+    external API call, the founder replies manually on Instagram first.
+    """
+    __tablename__ = "dm_replies"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
+    brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    message_id:      Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    conversation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    user_id:         Mapped[str] = mapped_column(String(255), nullable=False)
+    username:        Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    original_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    category:         Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+
+    auto_send:      Mapped[bool]          = mapped_column(Boolean, nullable=False, default=False)
+    flag_for_human: Mapped[bool]          = mapped_column(Boolean, nullable=False, default=False)
+    flag_priority:  Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    flag_reason:    Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    reply_text: Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
+    auto_sent:  Mapped[bool]               = mapped_column(Boolean, nullable=False, default=False)
+    sent_at:    Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="flagged_open", index=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

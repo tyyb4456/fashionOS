@@ -40,7 +40,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import crud
-from db.schemas import MarketingActionSchema, PricingActionSchema, RestockRecommendationSchema
+from db.schemas import DMReplySchema, MarketingActionSchema, PricingActionSchema, RestockRecommendationSchema
 from db.session import get_session
 
 from api.auth import get_current_brand
@@ -364,3 +364,32 @@ async def update_content_status(
         session, record_id=str(record_id), new_status=body.new_status, brand_id=brand.brand_id
     )
     return {"id": str(record_id), "status": body.new_status, "sku": rec.sku}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DM APPROVALS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.patch(
+    "/dm/{record_id}/resolve",
+    response_model=DMReplySchema,
+    summary="Mark a flagged DM as resolved",
+    description=(
+        "No external API call — the founder replies to the customer manually on "
+        "Instagram, then marks it resolved here so it drops off the flagged queue."
+    ),
+)
+async def resolve_dm(
+    record_id: UUID,
+    brand:     Brand = Depends(get_current_brand),
+    session:   AsyncSession = Depends(get_session),
+) -> DMReplySchema:
+    rec = await crud.get_dm_reply(session, record_id=str(record_id))
+    if not rec:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DM record not found.")
+    if rec.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this record.")
+    if rec.status != "flagged_open":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Already in status '{rec.status}'.")
+
+    updated = await crud.mark_dm_resolved(session, record_id=str(record_id), brand_id=brand.brand_id)
+    return DMReplySchema.model_validate(updated)

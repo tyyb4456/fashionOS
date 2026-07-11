@@ -37,6 +37,7 @@ from db.schemas import (
     AlertSchema,
     ContentPostSchema,
     DashboardSummarySchema,
+    DMReplySchema,
     InventorySnapshotSchema,
     MarketingActionSchema,
     PricingActionSchema,
@@ -96,6 +97,7 @@ async def get_run(
     marketing       = await crud.get_run_marketing(session, run_id=run_id)
     content         = await crud.get_run_content(session, run_id=run_id)
     return_insights = await crud.get_run_return_insights(session, run_id=run_id)
+    dm_replies      = await crud.get_run_dm_replies(session, run_id=run_id)
 
     detail = RunDetailSchema.model_validate(run)
     detail.inventory_snapshots = [InventorySnapshotSchema.model_validate(s) for s in snapshots]
@@ -104,6 +106,7 @@ async def get_run(
     detail.marketing_actions   = [MarketingActionSchema.model_validate(m) for m in marketing]
     detail.content_posts       = [ContentPostSchema.model_validate(c) for c in content]
     detail.return_insights     = [ReturnInsightSchema.model_validate(r) for r in return_insights]
+    detail.dm_replies          = [DMReplySchema.model_validate(d) for d in dm_replies]
 
     return detail
 
@@ -185,6 +188,26 @@ async def get_run_return_insights(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
     records = await crud.get_run_return_insights(session, run_id=run_id)
     return [ReturnInsightSchema.model_validate(r) for r in records]
+
+
+@router.get(
+    "/runs/{run_id}/dm",
+    response_model=list[DMReplySchema],
+    summary="Get DM replies for a run",
+    description="All DMs processed by the DM Agent in a specific run — auto-replies and flagged items.",
+)
+async def get_run_dm_replies_endpoint(
+    run_id:  str,
+    brand:   Brand = Depends(get_current_brand),
+    session: AsyncSession = Depends(get_session),
+) -> list[DMReplySchema]:
+    run = await crud.get_run(session, run_id=run_id)
+    if not run:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+    if run.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
+    records = await crud.get_run_dm_replies(session, run_id=run_id)
+    return [DMReplySchema.model_validate(r) for r in records]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -295,6 +318,25 @@ async def get_return_insights(
     return [ReturnInsightSchema.model_validate(r) for r in records]
 
 
+@router.get(
+    "/dm/flagged",
+    response_model=list[DMReplySchema],
+    summary="Get flagged DM queue",
+    description=(
+        "DMs flagged for human attention (bulk inquiries, complaints, influencer "
+        "requests). Use ?status=flagged_resolved to view history. High priority first."
+    ),
+)
+async def get_flagged_dms_endpoint(
+    brand:   Brand = Depends(get_current_brand),
+    status_: str          = Query("flagged_open", alias="status", description="flagged_open | flagged_resolved"),
+    limit:   int          = Query(100, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+) -> list[DMReplySchema]:
+    records = await crud.get_flagged_dms(session, brand_id=brand.brand_id, status=status_, limit=limit)
+    return [DMReplySchema.model_validate(r) for r in records]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SKU TIME-SERIES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -345,6 +387,7 @@ async def get_dashboard(
     pending_marketing    = await crud.get_pending_marketing(session, brand_id=brand.brand_id)
     pending_content      = await crud.get_content_queue(session, brand_id=brand.brand_id, status="pending")
     open_return_insights = await crud.get_return_insights(session, brand_id=brand.brand_id)
+    open_flagged_dms     = await crud.get_flagged_dms(session, brand_id=brand.brand_id, status="flagged_open", limit=500)
 
     last_run = recent_runs[0] if recent_runs else None
 
@@ -362,6 +405,7 @@ async def get_dashboard(
         pending_marketing_actions = len(pending_marketing),
         pending_content_posts     = len(pending_content),
         open_return_insights      = len(open_return_insights),
+        open_flagged_dms          = len(open_flagged_dms),
         seasonal_context           = SeasonalContextSchema(**current_seasonal_context()),
         recent_runs                 = [RunSummarySchema.model_validate(r) for r in recent_runs],
         critical_alerts              = [AlertSchema.model_validate(a) for a in critical_alerts],

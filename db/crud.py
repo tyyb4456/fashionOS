@@ -27,6 +27,7 @@ from db.models import (
     AgentRun,
     AlertRecord,
     ContentPostRecord,
+    DMReplyRecord,
     InventorySnapshotRecord,
     MarketingActionRecord,
     PricingActionRecord,
@@ -68,10 +69,11 @@ async def save_run(
         logger.warning(f"[DB] run_id={run_id} already in DB — skipping duplicate save.")
         return None
 
-    # ── Marketing stats for cached columns ────────────────────────────────────
+    # ── Marketing / DM stats for cached columns ───────────────────────────────
     marketing_stats   = summary.get("marketing", {})
     alert_counts      = summary.get("alert_counts", {})
     pricing_stats     = summary.get("pricing", {})
+    dm_stats          = summary.get("dm", {})
 
     # ── 1. AgentRun (parent row) ──────────────────────────────────────────────
     run = AgentRun(
@@ -98,6 +100,9 @@ async def save_run(
         marketing_decisions_total  = marketing_stats.get("total_decisions", 0),
         marketing_auto_executed    = marketing_stats.get("auto_executed", 0),
         marketing_pending_approval = marketing_stats.get("pending_approval", 0),
+
+        dm_auto_replied = dm_stats.get("auto_replied", 0),
+        dm_flagged_open = dm_stats.get("flagged", 0),
     )
     session.add(run)
 
@@ -244,6 +249,27 @@ async def save_run(
             evidence             = insight.get("evidence"),
         ))
 
+    # ── 9. DM replies (spam not persisted — noise reduction) ─────────────────
+    for reply in state.get("dm_replies", []):
+        session.add(DMReplyRecord(
+            run_id            = run_id,
+            brand_id          = summary["brand_id"],
+            message_id        = reply.get("message_id", ""),
+            conversation_id   = reply.get("conversation_id", ""),
+            user_id           = reply.get("user_id", ""),
+            username          = reply.get("username", ""),
+            original_message  = reply.get("original_message", ""),
+            category          = reply.get("category", "general_inquiry"),
+            auto_send         = reply.get("auto_send", False),
+            flag_for_human    = reply.get("flag_for_human", False),
+            flag_priority     = reply.get("flag_priority"),
+            flag_reason       = reply.get("flag_reason"),
+            reply_text        = reply.get("reply_text"),
+            auto_sent         = reply.get("auto_sent", False),
+            sent_at           = _parse_dt(reply.get("sent_at")),
+            status            = reply.get("status", "flagged_open"),
+        ))
+
     logger.info(
         f"[DB] Queued run={run_id} | "
         f"snapshots={len(state.get('inventory_snapshot', []))} | "
@@ -251,7 +277,8 @@ async def save_run(
         f"alerts={len(state.get('alerts', []))} | "
         f"marketing={len(state.get('marketing_actions', []))} | "
         f"content={len(state.get('content_queue', []))} | "
-        f"return_insights={len(state.get('return_insights', []))}"
+        f"return_insights={len(state.get('return_insights', []))} | "
+        f"dm_replies={len(state.get('dm_replies', []))}"
     )
     return run
 
@@ -496,6 +523,37 @@ async def get_run_return_insights(
     return list(result.scalars().all())
 
 
+async def get_run_dm_replies(
+    session: AsyncSession, run_id: str
+) -> list[DMReplyRecord]:
+    result = await session.execute(
+        select(DMReplyRecord).where(DMReplyRecord.run_id == run_id)
+    )
+    return list(result.scalars().all())
+
+
+async def get_flagged_dms(
+    session: AsyncSession,
+    brand_id: str,
+    status: str = "flagged_open",
+    limit: int = 100,
+) -> list[DMReplyRecord]:
+    """High priority (bulk_inquiry, complaint) sorted before normal (influencer)."""
+    priority_order = {"high": 0, "normal": 1}
+    result = await session.execute(
+        select(DMReplyRecord)
+        .where(
+            DMReplyRecord.brand_id == brand_id,
+            DMReplyRecord.status   == status,
+        )
+        .order_by(desc(DMReplyRecord.created_at))
+        .limit(limit)
+    )
+    rows = list(result.scalars().all())
+    rows.sort(key=lambda r: priority_order.get(r.flag_priority, 9))
+    return rows
+
+
 # ── Helper ─────────────────────────────────────────────────────────────────────
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -562,6 +620,16 @@ async def get_content_post(
 ) -> Optional[ContentPostRecord]:
     result = await session.execute(
         select(ContentPostRecord).where(ContentPostRecord.id == record_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_dm_reply(
+    session: AsyncSession,
+    record_id: str,
+) -> Optional[DMReplyRecord]:
+    result = await session.execute(
+        select(DMReplyRecord).where(DMReplyRecord.id == record_id)
     )
     return result.scalar_one_or_none()
 
@@ -656,3 +724,17 @@ async def update_content_post_status(
     )
     await session.flush()
     return await get_content_post(session, record_id)
+
+async def mark_dm_resolved(
+    session: AsyncSession,
+    record_id: str,
+    brand_id: str,
+) -> Optional[DMReplyRecord]:
+    """Set status='flagged_resolved'. brand_id in WHERE prevents cross-tenant mutation."""
+    await session.execute(
+        sa_update(DMReplyRecord)
+        .where(DMReplyRecord.id == record_id, DMReplyRecord.brand_id == brand_id)
+        .values(status="flagged_resolved")
+    )
+    await session.flush()
+    return await get_dm_reply(session, record_id)
