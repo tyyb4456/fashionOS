@@ -1,34 +1,45 @@
 """
-Content Agent — FashionOS Phase 2 Operations
-============================================
+Content Agent — FashionOS Phase 2 Operations (deterministic-split rewrite)
+============================================================================
 Reads trend_signals, inventory_snapshot, and pricing_recommendations already
 in state (set by Trend, Inventory, and Pricing agents). Selects the best
-products to create content for this cycle. Generates Instagram captions and
-TikTok scripts using the fashion_content domain skill.
+products to create content for this cycle, then computes everything that has
+a fixed answer — posting times, sale price text, hashtags — in plain Python.
+The LLM only writes the creative parts: caption, TikTok script beats, and
+filming notes.
 
 Graph topology  (4 nodes, sequential):
 
     START
       │
       ▼
-  prepare_content_data    ← Node 1: NO MCP — pure logic on state data.
-      │                              Selects up to 5 candidates per run.
-      │                              Priority: trending → on-sale → high-velocity.
-      │                              Skips: clearance, zero-stock, no-SKU.
+  prepare_content_data  ← Node 1: NO MCP — pure logic on state data.
+      │                            Selects up to 5 candidates per run.
+      │                            Priority: trending → on-sale → high-velocity.
+      │                            Skips: clearance, zero-stock, no-SKU.
       ▼
-  load_domain_skill       ← Node 2: load_skill("fashion_content")
-      │                              Caption formula, TikTok structure, brand voice.
+  compute_content_plan  ← Node 2: PURE PYTHON. Posting times (fixed
+      │                            constants), sale_mention (price template),
+      │                            hashtags (keyword rules on brand-controlled
+      │                            product titles + agents/seasonal.py's
+      │                            demand calendar), trigger, is_urgent.
+      │                            No LLM — the fashion_content skill already
+      │                            gives an exact formula for all of this.
       ▼
-  run_gemini_analysis     ← Node 3: Single structured Gemini call.
-      │                              Per candidate: Instagram caption + TikTok script.
-      │                              Urdu-English mix, no clichés, PST-aware timing.
+  generate_content_copy ← Node 3: THE ONLY LLM CALL. Given the fully
+      │                            computed plan, writes per-candidate
+      │                            Instagram caption, TikTok hook/context/
+      │                            reveal/cta, and creator notes. Loads
+      │                            fashion_content skill inline — a sync
+      │                            dict lookup doesn't need its own node.
       ▼
-  write_state_outputs     ← Node 4: Writes content_queue + alerts to state.
-      │                              Urgent posts (trending) raise "info" alerts.
+  write_state_outputs   ← Node 4: Merges Node 2's plan + Node 3's copy into
+      │                            content_queue + alerts. Urgent posts
+      │                            (trending) raise an "info" alert.
       ▼
     END
 
-Selection logic (Node 1):
+Selection logic (Node 1, unchanged):
   Priority 1 — Trending + in stock + not clearance  → urgency="high", post TODAY
     Reads trend_signals where direction in ("rising","peaking") and matched_sku exists.
     Must have current_stock > 5 in inventory_snapshot. Max 3 from this bucket.
@@ -40,20 +51,25 @@ Selection logic (Node 1):
   Hard skip: clearance_code action, current_stock ≤ 5, no matched SKU in inventory.
   Total cap: 5 candidates per run.
 
-What it generates per candidate:
-  Instagram:
-    - Full caption (hook → product desc → CTA, 80-150 words)
-    - 20-25 hashtags (niche PK + product + occasion + trending)
-    - Optimal post time: 20:00 PKT
+Deterministic plan (Node 2, new):
+  - optimal_post_time_instagram / _tiktok: fixed constants (20:00 / 19:00 PKT),
+    configurable via env var — the skill states these exactly, no reason to
+    have the LLM re-decide them every run.
+  - sale_mention: 'Now PKR {recommended_price} (was PKR {current_price})'
+    templated directly from Pricing Agent numbers when is_on_sale.
+  - hashtags: broad PK (fixed 5) + product-specific (keyword-matched against
+    product_title/variant_title — brand-controlled text, same category of
+    parsing as Restock's supplier_type classification) + occasion/style
+    (keyword-matched, falling back to the current seasonal context from
+    agents/seasonal.py when the title doesn't name an occasion) + niche PK
+    (fixed 4) + trend keyword (when trending). Deterministic and consistent
+    run to run instead of the LLM re-inventing a hashtag mix each time.
+  - trigger: "trending" | "on_sale". is_urgent: mirrors Node 1's urgency bucket.
 
-  TikTok:
-    - Hook (0-3s): show outcome first
-    - Context (3-8s): occasion or problem setup
-    - Reveal (8-20s): details, fabric, price, styling
-    - CTA (last 3s): DM / link / stock urgency
-    - Optimal post time: 19:00 PKT
-
-  Both: creator notes (what to film/photograph)
+What Node 3 writes (creative only):
+  Instagram caption, TikTok hook/context/reveal/cta, creator notes — the
+  same skill-driven brand-voice rules as before, just no longer sharing the
+  call with fixed-format fields.
 
 No MCP calls — all input data comes from earlier agents in the same run.
 Uses Gemini via Vertex AI (Google Cloud requirement) when GOOGLE_CLOUD_PROJECT set.
@@ -74,9 +90,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from agents.skills import load_skill
-from agents.state import AgentAlert, InventorySnapshot, PricingRecommendation, TrendSignal
+from agents.seasonal import current_seasonal_context
+from agents.state import AgentAlert, ContentQueueItem, InventorySnapshot, PricingRecommendation, TrendSignal
 
-from response_schemas.content_model import ContentPlan, ContentPost
+from response_schemas.content_model import ContentCopyPlan, ContentPlanItem
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -97,6 +114,94 @@ MAX_CANDIDATES      = int(os.getenv("CONTENT_MAX_CANDIDATES",   "5"))
 MAX_TRENDING        = int(os.getenv("CONTENT_MAX_TRENDING",      "3"))
 MIN_STOCK_THRESHOLD = int(os.getenv("CONTENT_MIN_STOCK",         "5"))
 
+CONTENT_IG_POST_TIME     = os.getenv("CONTENT_IG_POST_TIME",     "20:00 PKT")
+CONTENT_TIKTOK_POST_TIME = os.getenv("CONTENT_TIKTOK_POST_TIME", "19:00 PKT")
+
+# ── Hashtag rules (deterministic — brand-controlled product text + skill's fixed mix) ──
+
+_BROAD_PK_HASHTAGS = ["PakistaniFashion", "PakistaniOutfits", "FashionTikTokPK", "OutfitOfTheDay", "OOTDPakistan"]
+_NICHE_PK_HASHTAGS = ["PakistaniFashionBlogger", "DesiStyle", "KarachiStyle", "LahoreStyle"]
+
+_PRODUCT_HASHTAG_RULES: list[tuple[tuple[str, ...], str]] = [
+    (("cargo",), "CargoPants"),
+    (("co-ord", "coord", "co ord"), "CoOrdSet"),
+    (("lawn",), "LawnSuit"),
+    (("kurta", "kurti"), "KurtiDesign"),
+    (("chiffon",), "ChiffonWear"),
+    (("dupatta",), "DupattaStyle"),
+    (("palazzo",), "PalazzoPants"),
+    (("abaya",), "AbayaStyle"),
+    (("shalwar", "kameez"), "ShalwarKameez"),
+    (("saree", "sari"), "SareeStyle"),
+    (("linen",), "LinenWear"),
+    (("khaddar",), "KhaddarFabric"),
+    (("formal",), "FormalWear"),
+]
+_PRODUCT_HASHTAG_FALLBACK = "NewDrop"
+
+_OCCASION_HASHTAG_RULES: list[tuple[tuple[str, ...], str]] = [
+    (("eid",), "EidOutfit"),
+    (("wedding", "mehndi", "baraat", "walima"), "WeddingSeason"),
+    (("party",), "PartyWear"),
+    (("casual",), "CasualWear"),
+    (("summer",), "SummerFashion"),
+    (("winter",), "WinterFashion"),
+]
+
+
+def _season_hashtag(season_label: str) -> str:
+    """Falls back to the active seasonal context when the title names no occasion.
+    Substring-matched (not exact) so it stays correct across years without edits."""
+    if "eid" in season_label:
+        return "EidOutfit"
+    if "summer" in season_label:
+        return "SummerFashion"
+    if "winter" in season_label:
+        return "WinterWeddingSeason"
+    return "CasualWear"
+
+
+def _compute_hashtags(
+    product_title: str, variant_title: str,
+    is_trending: bool, trend_keyword: str,
+    season_label: str,
+) -> list[str]:
+    """
+    Deterministic hashtag mix matching the fashion_content skill's exact
+    formula: broad PK + product-specific + occasion/style + niche PK +
+    trending. Product/occasion matching is keyword-based against
+    brand-controlled product text — the same category of parsing Restock's
+    supplier_type classifier and Pricing's unit-cost heuristic already do.
+    """
+    text = f"{product_title} {variant_title}".lower()
+    tags: list[str] = list(_BROAD_PK_HASHTAGS)
+
+    product_tags = [tag for keywords, tag in _PRODUCT_HASHTAG_RULES if any(kw in text for kw in keywords)]
+    if not product_tags:
+        product_tags = [_PRODUCT_HASHTAG_FALLBACK]
+    tags.extend(product_tags[:5])
+
+    occasion_tags = [tag for keywords, tag in _OCCASION_HASHTAG_RULES if any(kw in text for kw in keywords)]
+    if not occasion_tags:
+        occasion_tags = [_season_hashtag(season_label)]
+    tags.extend(occasion_tags[:2])
+
+    tags.extend(_NICHE_PK_HASHTAGS)
+
+    if is_trending and trend_keyword:
+        trend_tag = "".join(word.capitalize() for word in trend_keyword.split())
+        if trend_tag:
+            tags.append(trend_tag)
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped
+
+
 # ── Subgraph state ─────────────────────────────────────────────────────────────
 
 class ContentAgentState(TypedDict):
@@ -113,12 +218,14 @@ class ContentAgentState(TypedDict):
     # Node 1 output (internal scratch — LangGraph drops on merge)
     content_candidates: list[dict]
 
-    # Internal scratch
-    skill_content: str
-    raw_analysis:  str
+    # Node 2 output (deterministic plan — internal scratch)
+    computed_plan: list[dict]
+
+    # Node 3 output (LLM scratch)
+    raw_copy: str
 
     # Final outputs → operator.add merges safely with other agents
-    content_queue: Annotated[list[dict], operator.add]
+    content_queue: Annotated[list[ContentQueueItem], operator.add]
     alerts:        Annotated[list[AgentAlert], operator.add]
 
 
@@ -260,103 +367,138 @@ def prepare_content_data(state: ContentAgentState) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 2 — load_domain_skill
+# NODE 2 — compute_content_plan (deterministic, no LLM)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_domain_skill(state: ContentAgentState) -> dict:
-    """Loads fashion_content skill: caption formula, TikTok structure, brand voice, posting times."""
-    skill = load_skill("fashion_content")
-    print("[Content] Domain skill loaded.")
-    return {"skill_content": skill}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — run_gemini_analysis
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def run_gemini_analysis(state: ContentAgentState) -> dict:
+def compute_content_plan(state: ContentAgentState) -> dict:
     """
-    Single structured Gemini call that generates Instagram captions + TikTok scripts
-    for all selected candidates.
-
-    Input: content_candidates (from Node 1) + fashion_content skill + brand context.
-    Output: _ContentPlan with one _ContentPost per candidate.
-
-    Not a ReAct loop. All context is in state. One call is enough.
-    Uses Vertex AI (google_vertexai:gemini-2.5-flash) when GOOGLE_CLOUD_PROJECT set.
+    Posting times are fixed constants, sale_mention is a price template, and
+    hashtags are generated via keyword rules on brand-controlled product text
+    plus the seasonal demand calendar — none of this is free-form customer
+    language, so none of it needs an LLM call. Node 3 only ever sees
+    numbers/strings that are already final.
     """
-    candidates = state.get("content_candidates", [])
+    candidates   = state.get("content_candidates", [])
+    season_label = current_seasonal_context().get("season_label", "off_season")
 
-    if not candidates:
+    plan: list[dict] = []
+    for c in candidates:
+        sale_mention = None
+        if c.get("is_on_sale") and c.get("discount_pct", 0) > 0:
+            sale_mention = f"Now PKR {c['recommended_price']:.0f} (was PKR {c['current_price']:.0f})"
+
+        hashtags = _compute_hashtags(
+            product_title=c.get("product_title", ""),
+            variant_title=c.get("variant_title", ""),
+            is_trending=c.get("is_trending", False),
+            trend_keyword=c.get("trend_keyword", ""),
+            season_label=season_label,
+        )
+
+        item = ContentPlanItem(
+            sku=c["sku"], product_title=c.get("product_title", ""), variant_title=c.get("variant_title", ""),
+            current_stock=c.get("current_stock", 0),
+            current_price=c.get("current_price", 0.0), recommended_price=c.get("recommended_price", 0.0),
+            is_trending=c.get("is_trending", False),
+            trend_keyword=c.get("trend_keyword", ""), trend_platform=c.get("trend_platform", ""),
+            trend_direction=c.get("trend_direction", ""), trend_score=c.get("trend_score", 0.0),
+            is_on_sale=c.get("is_on_sale", False), discount_pct=c.get("discount_pct", 0.0),
+            sale_mention=sale_mention,
+            is_urgent=(c.get("urgency") == "high"),
+            trigger=("trending" if c.get("is_trending") else "on_sale"),
+            optimal_post_time_instagram=CONTENT_IG_POST_TIME,
+            optimal_post_time_tiktok=CONTENT_TIKTOK_POST_TIME,
+            hashtags=hashtags,
+        )
+        plan.append(item.model_dump())
+
+    n_urgent = sum(1 for p in plan if p["is_urgent"])
+    print(f"[Content] Plan computed: {len(plan)} candidates ({n_urgent} urgent). Season: {season_label}.")
+
+    return {"computed_plan": plan}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 3 — generate_content_copy (the ONLY LLM call)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def generate_content_copy(state: ContentAgentState) -> dict:
+    """
+    Every non-creative field — pricing, trend status, sale_mention, is_urgent,
+    posting times, hashtags — is already final from Node 2. This call writes
+    ONLY: the Instagram caption, the four TikTok script beats, and creator/
+    filming notes. Not a ReAct loop — all context is in state, one call is enough.
+    """
+    plan = state.get("computed_plan", [])
+
+    if not plan:
         print("[Content] No candidates — skipping content generation.")
-        empty = ContentPlan(
-            posts=[],
+        empty = ContentCopyPlan(
+            items=[],
             summary=(
                 "No content generated this cycle. "
                 "No trending or on-sale products with sufficient stock were found."
             ),
         )
-        return {"raw_analysis": empty.model_dump_json()}
+        return {"raw_copy": empty.model_dump_json()}
+
+    skill_content = load_skill("fashion_content")   # inlined — a sync dict lookup doesn't need its own node
+
+    compact = [
+        {
+            "sku": p["sku"], "product_title": p["product_title"], "variant_title": p["variant_title"],
+            "current_stock": p["current_stock"],
+            "current_price": p["current_price"], "recommended_price": p["recommended_price"],
+            "is_trending": p["is_trending"], "trend_keyword": p["trend_keyword"], "trend_direction": p["trend_direction"],
+            "is_on_sale": p["is_on_sale"], "discount_pct": p["discount_pct"], "sale_mention": p["sale_mention"],
+            "is_urgent": p["is_urgent"],
+        }
+        for p in plan
+    ]
 
     system_prompt = f"""You are the Content Agent for {state['brand_name']}, \
 a Pakistani fashion brand operating autonomously via AI.
 
-{state['skill_content']}
+{skill_content}
 
 ## Your task
-Generate Instagram captions and TikTok scripts for each product below.
-Write content that a real Pakistani fashion brand would actually post — not AI-sounding.
+Every field below — pricing, trend status, sale_mention, is_urgent — is FINAL, computed by \
+deterministic Python logic. Do NOT recompute, second-guess, or contradict any of it. \
+Write ONLY, per candidate:
+1. instagram_caption
+2. tiktok_hook, tiktok_context, tiktok_reveal, tiktok_cta
+3. creator_notes
 
 ## Brand voice rules (NON-NEGOTIABLE)
 - Conversational Urdu-English code-switching is natural and encouraged
   ("yaar", "bilkul", "Eid wali vibes", "must dekho")
 - NEVER use: stunning, gorgeous, look no further, must-have, elevate your look
 - ALWAYS mention at least one specific: fabric name, cut, or occasion
-- "Limited stock" → ONLY write this if current_stock < 20 (check the data)
-- CTA must be ONE clear action. Don't list multiple options.
-
-## Trending context
-If a product is marked is_trending=True, reference the trend naturally.
-Don't say "this is trending" — show it through the hook and context.
-Example: 'Cargo pants ka season aa gaya' (not 'Cargo pants are trending right now').
-
-## Sale context
-If is_on_sale=True and discount_pct > 0, the sale_mention field must have the
-exact price text: 'Now PKR {{recommended_price}} (was PKR {{current_price}})'.'.
-Weave this naturally into the TikTok reveal and Instagram caption.
-
-## Scheduling
-Instagram: always optimal_post_time_instagram = '20:00 PKT'
-TikTok:    always optimal_post_time_tiktok    = '19:00 PKT'
-If is_urgent=True, add note that content should go live TODAY at those times.
+- If sale_mention is set, use that EXACT price text somewhere in the caption and the TikTok reveal
+- If is_trending, reference the trend naturally through the hook/context — don't literally
+  say "this is trending". Example: 'Cargo pants ka season aa gaya' not 'Cargo pants are trending'.
+- If is_urgent, the creator_notes should note this needs filming today
 
 ## Output requirement
-Generate one _ContentPost per candidate. Every field is required.
+Generate one entry per candidate below. Every field is required. Never omit one.
 """
 
     user_msg = (
         f"Brand: {state['brand_name']}\n\n"
-        f"## Content candidates ({len(candidates)} products)\n"
-        f"```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
-        "Generate full Instagram + TikTok content for each candidate above."
+        f"## Content candidates ({len(compact)} products)\n"
+        f"```json\n{json.dumps(compact, indent=2)}\n```\n\n"
+        "Write the caption, TikTok script, and creator notes for each candidate above."
     )
 
-    structured_llm = model.with_structured_output(ContentPlan)
-    plan: ContentPlan = await structured_llm.ainvoke([
+    structured_llm = model.with_structured_output(ContentCopyPlan)
+    copy_plan: ContentCopyPlan = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_msg),
     ])
 
-    urgent  = [p for p in plan.posts if p.is_urgent]
-    normal  = [p for p in plan.posts if not p.is_urgent]
+    print(f"[Content] Copy generated for {len(copy_plan.items)} candidates. Summary: {copy_plan.summary}")
 
-    print(
-        f"[Content] Generated {len(plan.posts)} content pieces: "
-        f"{len(urgent)} urgent, {len(normal)} scheduled. "
-        f"Summary: {plan.summary}"
-    )
-
-    return {"raw_analysis": plan.model_dump_json()}
+    return {"raw_copy": copy_plan.model_dump_json()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -365,55 +507,66 @@ Generate one _ContentPost per candidate. Every field is required.
 
 def write_state_outputs(state: ContentAgentState) -> dict:
     """
-    Converts _ContentPost Pydantic objects → plain dicts for state.content_queue.
-    Each product becomes ONE dict containing both Instagram and TikTok content.
+    Merges Node 2's deterministic plan (posting times, hashtags, sale_mention,
+    trigger, is_urgent) with Node 3's creative copy into content_queue.
     Raises "info" alerts for urgent posts so they surface in the run dashboard.
     """
-    plan    = ContentPlan.model_validate_json(state["raw_analysis"])
-    now_iso = datetime.now(timezone.utc).isoformat()
+    plan      = state.get("computed_plan", [])
+    copy_plan = ContentCopyPlan.model_validate_json(state["raw_copy"])
+    now_iso   = datetime.now(timezone.utc).isoformat()
+
+    copy_by_sku = {c.sku: c for c in copy_plan.items}
 
     content_queue: list[dict] = []
     alerts:        list[AgentAlert] = []
 
-    for post in plan.posts:
+    for p in plan:
+        copy = copy_by_sku.get(p["sku"])
+        if copy is None:
+            print(f"[Content] WARNING: no copy generated for {p['sku']} — skipping.")
+            continue
+
         item = {
-            "sku":           post.sku,
-            "product_title": post.product_title,
-            "variant_title": post.variant_title,
-            "is_urgent":     post.is_urgent,
+            "sku":           p["sku"],
+            "product_title": p["product_title"],
+            "variant_title": p["variant_title"],
+            "is_urgent":     p["is_urgent"],
+            "trigger":       p["trigger"],
+            "trend_score":   p["trend_score"] if p["is_trending"] else None,
+            "discount_pct":  p["discount_pct"],
             "status":        "pending",
             "created_at":    now_iso,
             "instagram": {
-                "caption":      post.instagram_caption,
-                "hashtags":     post.instagram_hashtags,
-                "optimal_time": post.optimal_post_time_instagram,
+                "caption":      copy.instagram_caption,
+                "hashtags":     p["hashtags"],
+                "optimal_time": p["optimal_post_time_instagram"],
             },
             "tiktok": {
                 "script": {
-                    "hook":    post.tiktok_hook,
-                    "context": post.tiktok_context,
-                    "reveal":  post.tiktok_reveal,
-                    "cta":     post.tiktok_cta,
+                    "hook":    copy.tiktok_hook,
+                    "context": copy.tiktok_context,
+                    "reveal":  copy.tiktok_reveal,
+                    "cta":     copy.tiktok_cta,
                 },
-                "optimal_time": post.optimal_post_time_tiktok,
+                "optimal_time": p["optimal_post_time_tiktok"],
             },
-            "creator_notes": post.creator_notes,
-            "sale_mention":  post.sale_mention,
+            "creator_notes": copy.creator_notes,
+            "sale_mention":  p["sale_mention"],
         }
         content_queue.append(item)
 
         # Alert for urgent posts so they surface in dashboard + run summary
-        if post.is_urgent:
+        if p["is_urgent"]:
             alerts.append(AgentAlert(
                 level      = "info",
                 agent      = "content_agent",
                 message    = (
-                    f"CONTENT READY — POST TODAY: {post.product_title} ({post.sku}). "
-                    f"Instagram at {post.optimal_post_time_instagram}, "
-                    f"TikTok at {post.optimal_post_time_tiktok}. "
-                    f"Creator notes: {post.creator_notes}"
+                    f"CONTENT READY — POST TODAY: {p['product_title']} ({p['sku']}). "
+                    f"Instagram at {p['optimal_post_time_instagram']}, "
+                    f"TikTok at {p['optimal_post_time_tiktok']}. "
+                    f"Creator notes: {copy.creator_notes}"
                 ),
-                sku        = post.sku,
+                sku        = p["sku"],
                 created_at = now_iso,
             ))
 
@@ -436,14 +589,14 @@ def build_content_graph() -> StateGraph:
     graph = StateGraph(ContentAgentState)
 
     graph.add_node("prepare_content_data",  prepare_content_data)
-    graph.add_node("load_domain_skill",     load_domain_skill)
-    graph.add_node("run_gemini_analysis",   run_gemini_analysis)
+    graph.add_node("compute_content_plan",  compute_content_plan)
+    graph.add_node("generate_content_copy", generate_content_copy)
     graph.add_node("write_state_outputs",   write_state_outputs)
 
     graph.add_edge(START,                    "prepare_content_data")
-    graph.add_edge("prepare_content_data",   "load_domain_skill")
-    graph.add_edge("load_domain_skill",      "run_gemini_analysis")
-    graph.add_edge("run_gemini_analysis",    "write_state_outputs")
+    graph.add_edge("prepare_content_data",   "compute_content_plan")
+    graph.add_edge("compute_content_plan",   "generate_content_copy")
+    graph.add_edge("generate_content_copy",  "write_state_outputs")
     graph.add_edge("write_state_outputs",    END)
 
     return graph.compile()
@@ -544,8 +697,8 @@ if __name__ == "__main__":
             "inventory_snapshot":     mock_inventory,
             "pricing_recommendations":mock_pricing,
             "content_candidates":     [],
-            "skill_content":          "",
-            "raw_analysis":           "",
+            "computed_plan":          [],
+            "raw_copy":               "",
             "content_queue":          [],
             "alerts":                 [],
         }
@@ -555,11 +708,11 @@ if __name__ == "__main__":
         print("\n── CONTENT QUEUE ──────────────────────────────────────────────")
         for item in result["content_queue"]:
             urgency_tag = "🔴 URGENT" if item["is_urgent"] else "🟡 scheduled"
-            print(f"\n  {urgency_tag} — {item['product_title']} ({item['sku']})")
+            print(f"\n  {urgency_tag} [{item['trigger']}] — {item['product_title']} ({item['sku']})")
             print(f"  IG time: {item['instagram']['optimal_time']} | TikTok time: {item['tiktok']['optimal_time']}")
             print(f"\n  📸 Instagram caption:")
             print(f"  {item['instagram']['caption'][:200]}...")
-            print(f"\n  Hashtags ({len(item['instagram']['hashtags'])}): #{' #'.join(item['instagram']['hashtags'][:6])}...")
+            print(f"\n  Hashtags ({len(item['instagram']['hashtags'])}): #{' #'.join(item['instagram']['hashtags'])}")
             print(f"\n  🎬 TikTok hook: {item['tiktok']['script']['hook']}")
             print(f"  🎬 TikTok CTA:  {item['tiktok']['script']['cta']}")
             print(f"\n  📋 Creator notes: {item['creator_notes']}")

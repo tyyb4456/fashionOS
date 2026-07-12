@@ -161,6 +161,12 @@ class ContentPostSchema(_Base):
     variant_title:       str
     is_urgent:           bool
     status:              str    # "pending" | "posted" | "skipped"
+
+    # NEW
+    trigger:      str = "on_sale"   # "trending" | "on_sale"
+    trend_score:  Optional[float] = None
+    discount_pct: float = 0.0
+
     instagram_caption:   Optional[str]
     instagram_hashtags:  Optional[Any]   # list[str]
     instagram_post_time: Optional[str]

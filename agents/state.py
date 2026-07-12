@@ -148,6 +148,32 @@ class DMReply(TypedDict):
     status: str   # "auto_sent" | "send_failed" | "flagged_open" | "flagged_resolved"
 
 
+class ContentQueueItem(TypedDict):
+    """
+    One generated content piece (Instagram + TikTok) — written by the Content
+    Agent. Posting times, hashtags, sale_mention, trigger, and is_urgent are
+    all computed deterministically (Node 2 — compute_content_plan). Only the
+    nested caption/script text and creator_notes come from the LLM (Node 3).
+    """
+    sku:           str
+    product_title: str
+    variant_title: str
+
+    is_urgent:    bool
+    trigger:      str             # "trending" | "on_sale"
+    trend_score:  Optional[float] # None unless trigger == "trending"
+    discount_pct: float
+
+    status:     str   # "pending" | "posted" | "skipped"
+    created_at: str
+
+    instagram: dict   # {"caption": str, "hashtags": list[str], "optimal_time": str}
+    tiktok:    dict   # {"script": {"hook","context","reveal","cta"}, "optimal_time": str}
+
+    creator_notes: str
+    sale_mention:  Optional[str]
+
+
 class AgentAlert(TypedDict):
     level:      str    # "critical" | "warning" | "info"
     agent:      str    # which agent raised this
@@ -183,7 +209,7 @@ class FashionOSState(TypedDict):
     pricing_recommendations:    Annotated[list[PricingRecommendation], operator.add]
     restock_recommendations:    Annotated[list[RestockRecommendation], operator.add]
     marketing_actions:          Annotated[list[MarketingAction], operator.add]
-    content_queue:              Annotated[list[dict], operator.add]  # Posts to schedule
+    content_queue:              Annotated[list[ContentQueueItem], operator.add]  # Posts to schedule
     dm_replies:                 Annotated[list[DMReply], operator.add]  # Auto-replies + flagged DMs
     alerts:                     Annotated[list[AgentAlert], operator.add]
 

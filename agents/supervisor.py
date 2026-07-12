@@ -202,7 +202,7 @@ async def run_content_agent(state: FashionOSState) -> dict:
         "trend_signals": state.get("trend_signals", []),
         "inventory_snapshot": state.get("inventory_snapshot", []),
         "pricing_recommendations": state.get("pricing_recommendations", []),
-        "content_candidates": [], "skill_content": "", "raw_analysis": "",
+        "content_candidates": [], "computed_plan": [], "raw_copy": "",
         "content_queue": [], "alerts": [],
     })
     urgent = [p for p in result["content_queue"] if p.get("is_urgent")]

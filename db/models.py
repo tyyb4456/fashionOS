@@ -291,6 +291,11 @@ class ContentPostRecord(Base):
     # "pending" | "posted" | "skipped"
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
 
+    # NEW — deterministic content intelligence
+    trigger:      Mapped[str]             = mapped_column(String(30), nullable=False, default="on_sale")
+    trend_score:  Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    discount_pct: Mapped[float]           = mapped_column(Float, nullable=False, default=0.0)
+
     # Instagram content
     instagram_caption:   Mapped[Optional[str]]  = mapped_column(Text,        nullable=True)
     instagram_hashtags:  Mapped[Optional[Any]]  = mapped_column(JSON,        nullable=True)  # list[str]
