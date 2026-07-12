@@ -42,6 +42,16 @@ class TrendSignal(TypedDict):
     direction:  str           # "rising" | "peaking" | "declining"
     matched_sku: Optional[str] # SKU in the store that matches this trend
 
+    # NEW — was already computed by the LLM every run, but silently dropped
+    # before ever reaching state. Now persisted to the trend_signals table.
+    evidence:                    str
+
+    # NEW — computed deterministically in Python (agents/trend/graph.py
+    # ::compute_trend_alerts), not self-reported by the LLM. Both are fully
+    # derivable from score/direction/matched_sku plus persisted history.
+    is_new_product_opportunity:  bool
+    score_delta:                 Optional[float]  # vs. last recorded reading; None if never seen before
+
 
 class PricingRecommendation(TypedDict):
     sku:              str

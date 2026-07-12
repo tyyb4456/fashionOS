@@ -17,7 +17,7 @@ Session 8 additions (multi-tenancy hardening):
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import desc, select
@@ -33,6 +33,7 @@ from db.models import (
     PricingActionRecord,
     RestockRecommendationRecord,
     ReturnInsightRecord,
+    TrendSignalRecord,
 )
 
 from sqlalchemy import update as sa_update
@@ -273,6 +274,20 @@ async def save_run(
             status            = reply.get("status", "flagged_open"),
         ))
 
+    # ── 10. Trend signals ─────────────────────────────────────────────────────
+    for sig in state.get("trend_signals", []):
+        session.add(TrendSignalRecord(
+            run_id                     = run_id,
+            brand_id                   = summary["brand_id"],
+            keyword                    = sig.get("keyword", ""),
+            platform                   = sig.get("platform", ""),
+            score                      = sig.get("score", 0.0),
+            direction                  = sig.get("direction", "rising"),
+            matched_sku                = sig.get("matched_sku"),
+            evidence                   = sig.get("evidence"),
+            is_new_product_opportunity = sig.get("is_new_product_opportunity", False),
+        ))
+
     logger.info(
         f"[DB] Queued run={run_id} | "
         f"snapshots={len(state.get('inventory_snapshot', []))} | "
@@ -281,7 +296,8 @@ async def save_run(
         f"marketing={len(state.get('marketing_actions', []))} | "
         f"content={len(state.get('content_queue', []))} | "
         f"return_insights={len(state.get('return_insights', []))} | "
-        f"dm_replies={len(state.get('dm_replies', []))}"
+        f"dm_replies={len(state.get('dm_replies', []))} | "
+        f"trend_signals={len(state.get('trend_signals', []))}"
     )
     return run
 
@@ -554,6 +570,55 @@ async def get_flagged_dms(
     )
     rows = list(result.scalars().all())
     rows.sort(key=lambda r: priority_order.get(r.flag_priority, 9))
+    return rows
+
+
+async def get_run_trend_signals(
+    session: AsyncSession, run_id: str
+) -> list[TrendSignalRecord]:
+    result = await session.execute(
+        select(TrendSignalRecord)
+        .where(TrendSignalRecord.run_id == run_id)
+        .order_by(desc(TrendSignalRecord.score))
+    )
+    return list(result.scalars().all())
+
+
+async def get_recent_trend_signals(
+    session: AsyncSession,
+    brand_id: str,
+    days: int = 3,
+) -> list[TrendSignalRecord]:
+    """
+    Used by agents/trend/graph.py::fetch_trend_history to give the ReAct
+    agent real history instead of starting cold every run.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    result = await session.execute(
+        select(TrendSignalRecord)
+        .where(
+            TrendSignalRecord.brand_id == brand_id,
+            TrendSignalRecord.created_at >= cutoff,
+        )
+        .order_by(desc(TrendSignalRecord.created_at))
+    )
+    return list(result.scalars().all())
+
+
+async def get_trend_signals_dashboard(
+    session: AsyncSession,
+    brand_id: str,
+    limit: int = 100,
+) -> list[TrendSignalRecord]:
+    """Recent signals for dashboard display — highest score first."""
+    result = await session.execute(
+        select(TrendSignalRecord)
+        .where(TrendSignalRecord.brand_id == brand_id)
+        .order_by(desc(TrendSignalRecord.created_at))
+        .limit(limit)
+    )
+    rows = list(result.scalars().all())
+    rows.sort(key=lambda r: -r.score)
     return rows
 
 

@@ -227,6 +227,25 @@ class DMReplySchema(_Base):
     created_at:         datetime
 
 
+class TrendSignalSchema(_Base):
+    """
+    One trend signal raised in a run by the Trend Agent. Persisted so the
+    agent has real history to compare against on its next run, and so the
+    dashboard can show what's being tracked over time.
+    """
+    id:          UUID
+    run_id:      str
+    brand_id:    str
+    keyword:     str
+    platform:    str    # "tiktok" | "instagram" | "google_trends"
+    score:       float
+    direction:   str    # "rising" | "peaking" | "declining"
+    matched_sku: Optional[str]
+    evidence:    Optional[str]
+    is_new_product_opportunity: bool
+    created_at:  datetime
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Run schemas — updated
@@ -272,6 +291,7 @@ class RunDetailSchema(RunSummarySchema):
     content_posts:        list[ContentPostSchema]       = []   # NEW
     return_insights:      list[ReturnInsightSchema]     = []   # NEW
     dm_replies:            list[DMReplySchema]           = []   # NEW
+    trend_signals:          list[TrendSignalSchema]       = []   # NEW
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -143,7 +143,7 @@ async def run_trend_agent(state: FashionOSState) -> dict:
     result = await trend_graph.ainvoke({
         "brand_id": state["brand_id"], "brand_name": state["brand_name"],
         "products": state.get("products", []), "social_signals": [], "trend_data": [],
-        "skill_content": "", "raw_analysis": "", "trend_signals": [], "alerts": [],
+        "skill_content": "", "trend_history": [], "raw_analysis": "", "trend_signals": [], "alerts": [],
     })
     print(f"[Supervisor] ✓ Trend: {len(result['trend_signals'])} signals, {len(result['alerts'])} alerts.")
     return {

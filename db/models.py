@@ -406,6 +406,40 @@ class DMReplyRecord(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# trend_signals  — persists Trend Agent findings per run, gives the agent memory
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TrendSignalRecord(Base):
+    """
+    One row per trend signal raised per run by the Trend Agent. Persisted so
+    the agent has real history to reason against (see agents/trend/graph.py
+    ::fetch_trend_history) instead of starting cold every run, and so the
+    dashboard can show what's being tracked over time.
+    """
+    __tablename__ = "trend_signals"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id:   Mapped[str] = mapped_column(String(36),  nullable=False, index=True)
+    brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    keyword:  Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    platform: Mapped[str] = mapped_column(String(30),  nullable=False)   # "tiktok" | "instagram" | "google_trends"
+
+    score:     Mapped[float] = mapped_column(Float,      nullable=False, default=0.0)
+    direction: Mapped[str]   = mapped_column(String(20), nullable=False, default="rising")
+
+    matched_sku: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    evidence:    Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    is_new_product_opportunity: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # chat_tool_results  — persists structured tool output per chat turn
 # ══════════════════════════════════════════════════════════════════════════════
 

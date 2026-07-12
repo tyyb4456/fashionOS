@@ -1,7 +1,37 @@
 """
-Trend Agent — Autonomous ReAct Version
-========================================
+Trend Agent — Autonomous ReAct Version (memory + alert-intelligence + catalog-search pass)
+==============================================================================================
 Replaces the fixed 4-node sequential graph with a LangGraph ReAct agent.
+
+Session update — ACTIVE CATALOG SEARCH (this pass):
+  SKU matching used to work by dumping the ENTIRE catalog as a JSON blob
+  straight into the system prompt, truncated at catalog[:50] — any brand
+  with a bigger catalog silently lost SKUs past the first 50 with no
+  visibility that it happened, and the agent had to eyeball-match keywords
+  against a wall of text instead of actively looking anything up.
+
+  SKU matching itself stays an LLM job — matching organic, evolving slang
+  ("cargo pants", "co-ord set") to product attributes is genuine language
+  judgment, not a fixed lookup table the way Restock's supplier
+  classification is. What changed is HOW the agent accesses the catalog:
+  a local search_catalog(query) tool, bound via closure to the FULL
+  (untruncated) catalog for this run, doing fuzzy matching (token
+  containment + character similarity, stdlib difflib — no new deps) and
+  returning scored candidates. The agent calls it per keyword instead of
+  holding the whole catalog in context — same "give it a tool, don't just
+  prompt-dump it" principle every MCP-backed node already follows, and it
+  removes the truncation bug for free.
+
+Session update — ALERT INTELLIGENCE (prior pass):
+  Alert eligibility (critical/info thresholds) and history-aware duplicate-
+  alert suppression are computed deterministically in Python
+  (compute_trend_alerts) instead of self-applied by the LLM. is_new_product_
+  opportunity and score_delta are both derived, not self-reported.
+
+Session update — MEMORY (prior pass):
+  trend_signals are persisted to Postgres. Node 1 (fetch_trend_history)
+  loads the last few days of signals for this brand before the ReAct loop
+  runs, so the agent has real history instead of starting cold.
 
 Old approach (hardcoded):
   fetch_social_data (fixed 2 TikTok hashtags + 2 IG hashtags, fixed Google Trends keywords)
@@ -9,25 +39,29 @@ Old approach (hardcoded):
   → run_gemini_analysis (single structured call, one shot)
   → write_state_outputs
 
-New approach (autonomous):
-  ReAct agent with full tool control:
-  - Agent decides which Pakistani fashion hashtags to try based on brand + catalog context
-  - Evaluates engagement quality per hashtag (views, likes, post count)
-  - Retries with different hashtags if data is thin or irrelevant
-  - Cross-references with Google Trends on its own initiative
-  - Iterates until it has strong, well-supported signals or has exhausted search space
-  → write_state_outputs (unchanged)
+Current approach:
+  fetch_trend_history    (Node 1 — pure DB read, no MCP, no LLM)
+  → run_react_agent      (Node 2 — ReAct agent, full tool control, incl. a
+      local search_catalog tool bound to the full catalog. Produces ONLY
+      trend_signals: score, direction, matched_sku, evidence.)
+  → compute_trend_alerts (Node 3 — pure Python. Critical/info thresholds,
+      history-aware duplicate suppression, is_new_product_opportunity,
+      score_delta. Every threshold is a fixed number stated once.)
+  → write_state_outputs  (Node 4 — type-safe passthrough.)
 
-Agent tools (from MCP servers):
+Agent tools:
   social-mcp: search_tiktok_hashtag, search_instagram_hashtag, get_trending_tiktok_sounds
   trends-mcp: get_trend_data, get_related_queries, compare_keywords
+  local:      search_catalog (fuzzy match against the brand's full catalog —
+              not an MCP call, pure in-memory computation, bound per run)
   (DM tools excluded — they need brand_id and are irrelevant to trend research)
 
-No hardcoded hashtag lists. No fixed iteration count.
-The LLM controls everything.
+No hardcoded hashtag lists. No fixed iteration count. Scoring, direction,
+SKU matching, and search strategy remain LLM/ReAct judgment.
 
-Graph topology (2 nodes):
-  START → run_react_agent → write_state_outputs → END
+Graph topology (4 nodes):
+  START → fetch_trend_history → run_react_agent → compute_trend_alerts
+        → write_state_outputs → END
 
 Requires LangGraph >= 0.2.7 for response_format on create_react_agent.
 """
@@ -35,21 +69,23 @@ Requires LangGraph >= 0.2.7 for response_format on create_react_agent.
 import json
 import operator
 import os
+import re
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, START, StateGraph
 from langchain.agents import create_agent
-from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from agents.skills import load_skill
 from agents.state import AgentAlert, TrendSignal
-from response_schemas.trend_model import TrendAnalysis, TrendAlertOut, TrendSignalOut
+from response_schemas.trend_model import TrendFindings, TrendSignalOut
 
 load_dotenv()
 
@@ -68,7 +104,15 @@ else:
     model = init_chat_model("google_genai:gemini-2.5-flash-lite")
     print("[Trend] GOOGLE_CLOUD_PROJECT not set — using google_genai (local dev).")
 
+TREND_HISTORY_LOOKBACK_DAYS = int(os.getenv("TREND_HISTORY_LOOKBACK_DAYS", "3"))
+TREND_REALERT_SCORE_DELTA   = float(os.getenv("TREND_REALERT_SCORE_DELTA", "0.15"))
 
+# Fixed thresholds — stated once, applied deterministically in compute_trend_alerts.
+CRITICAL_SCORE_FLOOR = float(os.getenv("TREND_CRITICAL_SCORE_FLOOR", "0.8"))
+INFO_SCORE_FLOOR      = float(os.getenv("TREND_INFO_SCORE_FLOOR",      "0.5"))
+
+CATALOG_MATCH_FLOOR = float(os.getenv("TREND_CATALOG_MATCH_FLOOR", "0.15"))  # below this, don't even return it
+CATALOG_MATCH_CONFIDENCE_HINT = 0.5  # documented match confidence the agent should treat as "good enough"
 
 
 # ── Subgraph state ─────────────────────────────────────────────────────────────
@@ -81,17 +125,28 @@ class TrendAgentState(TypedDict):
     brand_name: str
     products:   list[dict]   # From Inventory Agent via Supervisor
 
-    raw_analysis: str        # Internal: serialized _TrendAnalysis JSON
+    trend_history: list[dict]   # Node 1 output — recent signals for this brand
+
+    raw_findings: str           # Node 2 output — serialized TrendFindings JSON (signals only)
+    agent_error:  Optional[str] # Node 2 output — set if the ReAct loop itself failed
+
+    computed_signals: list[dict]   # Node 3 output — signals + is_new_product_opportunity + score_delta
+    computed_alerts:  list[dict]   # Node 3 output — {level, message, sku} dicts
 
     # operator.add → safe merge when Supervisor combines agent outputs
     trend_signals: Annotated[list[TrendSignal], operator.add]
     alerts:        Annotated[list[AgentAlert],  operator.add]
 
 
-# ── Helper ─────────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────
 
 def _build_catalog(products: list[dict]) -> list[dict]:
-    """Compact catalog for SKU matching in the agent prompt."""
+    """
+    Compact catalog — backing data for the search_catalog tool, NOT embedded
+    into the prompt as text anymore. No truncation: the tool operates over
+    the full list, so brands with more than 50 SKUs no longer silently lose
+    matching candidates.
+    """
     catalog = []
     for p in products:
         for v in p.get("variants", []):
@@ -103,11 +158,151 @@ def _build_catalog(products: list[dict]) -> list[dict]:
                     "variant_title": v.get("title", ""),
                     "tags":          p.get("tags", ""),
                 })
-    return catalog[:50]
+    return catalog
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9\s]", " ", text.lower()).strip()
+
+
+def _catalog_match_score(query: str, candidate_text: str) -> float:
+    """
+    Fuzzy match score 0.0-1.0. Token containment (how many query words
+    appear in the candidate) dominates, with a character-level similarity
+    ratio (difflib.SequenceMatcher) as a secondary signal — fashion keyword
+    matching cares more about term presence ("cargo", "co-ord") than raw
+    edit distance, since candidate text ("Olive Cargo Pants - Small") is
+    usually longer and phrased differently than the search query
+    ("cargo pants").
+    """
+    q_norm = _normalize(query)
+    c_norm = _normalize(candidate_text)
+    if not q_norm or not c_norm:
+        return 0.0
+
+    q_tokens = [t for t in q_norm.split() if len(t) > 2]  # skip tiny/noise words
+    if not q_tokens:
+        return 0.0
+
+    contained   = sum(1 for t in q_tokens if t in c_norm)
+    token_score = contained / len(q_tokens)
+    char_score  = SequenceMatcher(None, q_norm, c_norm).ratio()
+
+    return round(0.75 * token_score + 0.25 * char_score, 3)
+
+
+def _make_search_catalog_tool(catalog: list[dict]):
+    """
+    Builds a search_catalog tool bound (via closure) to this run's full
+    product catalog. Local computation, not an MCP call — no I/O needed, so
+    it stays synchronous.
+    """
+    @tool
+    def search_catalog(query: str, limit: int = 5) -> list[dict]:
+        """
+        Search the brand's product catalog for items matching a trending
+        keyword or phrase (e.g. "cargo pants", "co-ord set", "lawn suit",
+        "eid outfit"). Searches the FULL catalog, not a sample. Returns up
+        to `limit` best matches sorted by confidence, each with sku,
+        product_title, variant_title, tags, and match_confidence (0.0-1.0).
+        An empty list means no reasonable match exists in the catalog —
+        treat that as matched_sku=null (a new product opportunity), don't
+        guess a SKU that isn't actually a good fit.
+        """
+        capped = max(1, min(limit, 10))
+        scored: list[dict] = []
+        for item in catalog:
+            text  = f"{item['product_title']} {item['variant_title']} {item.get('tags', '')}"
+            score = _catalog_match_score(query, text)
+            if score > CATALOG_MATCH_FLOOR:
+                scored.append({**item, "match_confidence": score})
+        scored.sort(key=lambda x: -x["match_confidence"])
+        return scored[:capped]
+
+    return search_catalog
+
+
+async def _fetch_recent_trend_signals(brand_id: str, lookback_days: int) -> list[dict]:
+    """
+    Reads trend signals raised in the last N days so the ReAct agent can
+    compare against its own recent findings instead of starting cold every
+    run, and so Node 3 can enforce duplicate-alert suppression.
+
+    IMPORTANT: uses a fresh NullPool engine created inside THIS event loop.
+    Reusing db.session.AsyncSessionLocal's module-level pooled engine here
+    reproduces the Celery/Windows ProactorEventLoop bug (pooled connections
+    bound to the wrong event loop). Reference: agents/inventory/graph.py
+    ::_fetch_pending_restocks.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+    from db import crud as db_crud
+
+    database_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://fashionos:fashionos_dev@localhost:5432/fashionos",
+    )
+    engine  = create_async_engine(database_url, poolclass=NullPool)
+    Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    history: list[dict] = []
+    try:
+        async with Session() as session:
+            records = await db_crud.get_recent_trend_signals(session, brand_id=brand_id, days=lookback_days)
+            for rec in records:
+                history.append({
+                    "keyword":     rec.keyword,
+                    "platform":    rec.platform,
+                    "score":       rec.score,
+                    "direction":   rec.direction,
+                    "matched_sku": rec.matched_sku,
+                    "seen_at":     rec.created_at.isoformat(),
+                })
+    except Exception as exc:
+        print(f"[Trend] History lookup failed (non-fatal): {exc}")
+    finally:
+        await engine.dispose()
+
+    return history
+
+
+def _latest_per_keyword(history: list[dict]) -> list[dict]:
+    """
+    Collapses raw history to the single most recent reading per
+    (keyword, platform) — pure grouping/aggregation, same category of
+    Python job as Returns' Counter aggregation.
+    """
+    latest: dict[tuple[str, str], dict] = {}
+    for h in history:
+        key = (h["keyword"].lower(), h["platform"])
+        if key not in latest or h["seen_at"] > latest[key]["seen_at"]:
+            latest[key] = h
+    return sorted(latest.values(), key=lambda h: -h["score"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 1 — run_react_agent
+# NODE 1 — fetch_trend_history
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_trend_history(state: TrendAgentState) -> dict:
+    """
+    Loads the last TREND_HISTORY_LOOKBACK_DAYS of trend signals for this
+    brand so the ReAct agent has real memory instead of starting cold.
+    Runs before the tool loop — no MCP calls here, just Postgres.
+    """
+    raw_history   = await _fetch_recent_trend_signals(state["brand_id"], TREND_HISTORY_LOOKBACK_DAYS)
+    trend_history = _latest_per_keyword(raw_history)
+
+    print(
+        f"[Trend] Loaded {len(trend_history)} recent signals "
+        f"(last {TREND_HISTORY_LOOKBACK_DAYS} days) as history context."
+    )
+
+    return {"trend_history": trend_history}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 2 — run_react_agent
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def run_react_agent(state: TrendAgentState) -> dict:
@@ -118,9 +313,13 @@ async def run_react_agent(state: TrendAgentState) -> dict:
       3. Evaluates engagement quality
       4. Retries with different hashtags if results are thin
       5. Cross-references with Google Trends when social signals are strong
-      6. Decides when it has enough data to stop
-      7. Produces a _TrendAnalysis via response_format (structured output call
-         happens automatically after the agent finishes its tool loop)
+      6. Calls search_catalog(keyword) to actively look up SKU matches
+         against the FULL catalog, instead of eyeballing a static dump
+      7. Compares fresh findings against its own recent history to score/
+         describe movement accurately
+      8. Decides when it has enough data to stop
+      9. Produces a TrendFindings via response_format — signals ONLY.
+         Alert eligibility is computed downstream (Node 3), not here.
     """
     # ── Get tools from both MCP servers ───────────────────────────────────────
     social_client = MultiServerMCPClient(
@@ -139,12 +338,17 @@ async def run_react_agent(state: TrendAgentState) -> dict:
         t for t in social_tools
         if t.name in ("search_tiktok_hashtag", "search_instagram_hashtag", "get_trending_tiktok_sounds")
     ]
-    all_tools = scraping_tools + list(trends_tools)
-
-    print(f"[Trend] ReAct tools: {[t.name for t in all_tools]}")
 
     skill_content = load_skill("fashion_trend")
     catalog       = _build_catalog(state.get("products", []))
+    trend_history = state.get("trend_history", [])
+
+    # search_catalog is bound per-run to the FULL catalog via closure — not
+    # an MCP tool, pure local computation, no truncation.
+    search_catalog_tool = _make_search_catalog_tool(catalog)
+    all_tools = scraping_tools + list(trends_tools) + [search_catalog_tool]
+
+    print(f"[Trend] ReAct tools: {[t.name for t in all_tools]}")
 
     # ── System prompt — gives the agent its mission and decision framework ─────
     # This prompt replaces hardcoded hashtag lists and fixed iteration counts.
@@ -208,123 +412,246 @@ Do NOT keep searching indefinitely. Quality over quantity.
 "declining" → falling from peak
 
 ## SKU MATCHING
-For every trend signal, scan the catalog below.
-Match on: fabric names (lawn, linen, chiffon, khaddar, cotton),
-          style (co-ord, kurta, cargo, palazzo, dupatta, suit),
-          occasion (eid, formal, casual, summer, festive, mehndi).
-Set matched_sku to the best matching SKU string, or null if confidence < 50%.
+Your catalog has {len(catalog)} SKUs, searchable via the search_catalog(query, limit) tool
+— you do NOT have the full list in this prompt, call the tool instead:
+- For every trend signal you're keeping, call search_catalog with the keyword itself
+  (try the plain keyword first — e.g. "cargo pants", "co-ord set"). If that returns
+  nothing useful, try a related fabric/style/occasion term from the skill above.
+- search_catalog runs over the FULL catalog and returns each candidate's
+  match_confidence (0.0-1.0) — trust these results rather than guessing from memory.
+- If the top result's match_confidence is >= {CATALOG_MATCH_CONFIDENCE_HINT}, use its
+  sku as matched_sku.
+- If search_catalog returns nothing, or the best match_confidence is below
+  {CATALOG_MATCH_CONFIDENCE_HINT}, set matched_sku to null — this is a genuine new
+  product opportunity, not something to force-match.
+- You can call search_catalog more than once per keyword with different phrasing if
+  the first attempt doesn't turn up a confident match.
 
-## ALERT RULES
-critical: score ≥ 0.8 AND direction="rising" AND matched_sku is not null
-info:     score ≥ 0.5 AND matched_sku is null (new product opportunity)
-No alerts for score < 0.5.
+## RECENT SIGNAL HISTORY (last {TREND_HISTORY_LOOKBACK_DAYS} days, most recent reading per keyword)
+{json.dumps(trend_history, indent=2) if trend_history else "No history yet — this is either the first run or nothing was flagged recently."}
 
-## PRODUCT CATALOG ({len(catalog)} SKUs)
-{json.dumps(catalog, indent=2)}
+Use this to score and describe movement accurately — you do NOT need to decide
+whether to raise an alert, that's handled automatically downstream from your
+score/direction/matched_sku:
+- If a keyword below was already seen recently, compare your fresh research
+  against that reading. Is engagement actually higher, lower, or about the
+  same right now? Set direction and score based on what you find NOW, and
+  mention the comparison explicitly in evidence if it moved meaningfully.
+  Example: "Score up from 0.58 two days ago to 0.81 now — accelerating fast."
+- If a keyword isn't in this history at all, it's newly discovered this run —
+  research and score it normally, no special caveat needed.
+- Treat history as a reference point, not ground truth to copy blindly —
+  always verify with a fresh search this run rather than assuming yesterday's
+  numbers still hold.
 """
 
     user_message = (
         f"Research trending Pakistani fashion signals for {state['brand_name']}. "
         f"Choose your own hashtags. Iterate until you have strong, well-supported data. "
-        f"Match every signal to the product catalog. Discard thin or irrelevant hashtag results."
+        f"Use search_catalog to actively look up SKU matches for each keyword you're "
+        f"keeping — don't guess. Discard thin or irrelevant hashtag results. Compare "
+        f"findings against the recent signal history to describe movement accurately."
     )
 
     # ── Build and run ReAct agent ──────────────────────────────────────────────
     # response_format: after the agent finishes its tool loop, LangGraph makes
     # one final structured LLM call using the full conversation history.
-    # Result lands in result["structured_response"] as a _TrendAnalysis instance.
+    # Result lands in result["structured_response"] as a TrendFindings instance.
     agent = create_agent(
         model           = model,
         tools           = all_tools,
         system_prompt   = system_prompt,
-        response_format = TrendAnalysis,
+        response_format = TrendFindings,
     )
+
+    agent_error: Optional[str] = None
 
     try:
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=user_message)]},
             config={"recursion_limit": 20},   # ~25 tool-call iterations max
         )
-        analysis: TrendAnalysis = result["structured_response"]
+        findings: TrendFindings = result["structured_response"]
 
     except Exception as exc:
         print(f"[Trend] ReAct agent error: {exc}")
-        analysis = TrendAnalysis(
+        agent_error = str(exc)
+        findings = TrendFindings(
             trend_signals=[],
-            alerts=[TrendAlertOut(
-                level   = "warning",
-                message = (
-                    f"Trend agent failed: {exc}. "
-                    "Check social-mcp (:8002) and trends-mcp (:8003) health."
-                ),
-                sku=None,
-            )],
-            summary="Trend agent encountered an error. Check MCP server health.",
+            summary=(
+                f"Trend agent encountered an error: {exc}. "
+                "Check social-mcp (:8002) and trends-mcp (:8003) health."
+            ),
         )
 
-    rising  = [s for s in analysis.trend_signals if s.direction == "rising"]
-    matched = [s for s in analysis.trend_signals if s.matched_sku]
-    opps    = [s for s in analysis.trend_signals if s.is_new_product_opportunity]
+    rising  = [s for s in findings.trend_signals if s.direction == "rising"]
+    matched = [s for s in findings.trend_signals if s.matched_sku]
 
     print(
-        f"[Trend] ReAct complete: {len(analysis.trend_signals)} signals | "
-        f"{len(rising)} rising | {len(matched)} catalog-matched | "
-        f"{len(opps)} new product opportunities. "
-        f"Summary: {analysis.summary}"
+        f"[Trend] ReAct complete: {len(findings.trend_signals)} signals | "
+        f"{len(rising)} rising | {len(matched)} catalog-matched. "
+        f"Summary: {findings.summary}"
     )
 
-    return {"raw_analysis": analysis.model_dump_json()}
+    return {"raw_findings": findings.model_dump_json(), "agent_error": agent_error}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 2 — write_state_outputs (identical to v1 — supervisor contract unchanged)
+# NODE 3 — compute_trend_alerts (deterministic, no LLM)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_trend_alerts(state: TrendAgentState) -> dict:
+    """
+    Pure Python. Every threshold here (critical score floor, info score
+    floor, re-alert delta) is a fixed number stated once, not re-decided by
+    an LLM every run. is_new_product_opportunity and score_delta are both
+    fully derivable from fields the ReAct agent already produced — computed
+    here instead of self-reported, so they can't drift from the rule that
+    defines them.
+
+    Dedup uses the persisted history from Node 1: a keyword that was
+    ALREADY critical-eligible last time and hasn't moved by at least
+    TREND_REALERT_SCORE_DELTA gets downgraded to an "info" alert instead of
+    a repeat "critical" — this is now an enforced rule, not a prompt
+    suggestion the agent could ignore.
+    """
+    findings = TrendFindings.model_validate_json(
+        state.get("raw_findings") or '{"trend_signals": [], "summary": ""}'
+    )
+    history_by_key = {
+        (h["keyword"].lower(), h["platform"]): h
+        for h in state.get("trend_history", [])
+    }
+
+    computed_signals: list[dict] = []
+    alerts: list[dict] = []
+    n_suppressed = 0
+
+    for s in findings.trend_signals:
+        key   = (s.keyword.lower(), s.platform)
+        prior = history_by_key.get(key)
+
+        is_new_opportunity = s.matched_sku is None and s.score >= INFO_SCORE_FLOOR
+        is_critical_eligible = (
+            s.score >= CRITICAL_SCORE_FLOOR
+            and s.direction == "rising"
+            and s.matched_sku is not None
+        )
+
+        score_delta: Optional[float] = None
+        prior_was_critical = False
+        if prior:
+            score_delta = round(s.score - prior["score"], 2)
+            prior_was_critical = (
+                prior["score"] >= CRITICAL_SCORE_FLOOR
+                and prior["direction"] == "rising"
+                and prior["matched_sku"] is not None
+            )
+
+        computed_signals.append({
+            "keyword": s.keyword, "platform": s.platform, "score": s.score,
+            "direction": s.direction, "matched_sku": s.matched_sku, "evidence": s.evidence,
+            "is_new_product_opportunity": is_new_opportunity, "score_delta": score_delta,
+        })
+
+        # ── Critical alert (rising + matched + high score) ──────────────────
+        if is_critical_eligible:
+            suppress = (
+                prior_was_critical
+                and score_delta is not None
+                and score_delta < TREND_REALERT_SCORE_DELTA
+            )
+            if suppress:
+                n_suppressed += 1
+                alerts.append({
+                    "level": "info",
+                    "message": (
+                        f"'{s.keyword}' still trending on {s.platform} "
+                        f"(score {s.score:.2f}, matched to {s.matched_sku}) — no significant "
+                        f"change since last check (Δ{score_delta:+.2f}). {s.evidence}"
+                    ),
+                    "sku": s.matched_sku,
+                })
+            else:
+                if score_delta is not None and score_delta > 0:
+                    accel_note = f" Score up {score_delta:+.2f} since last seen."
+                elif score_delta is None:
+                    accel_note = " First time seeing this signal."
+                else:
+                    accel_note = ""
+                alerts.append({
+                    "level": "critical",
+                    "message": (
+                        f"TRENDING NOW: '{s.keyword}' (score {s.score:.2f}, rising) on "
+                        f"{s.platform} — matched to {s.matched_sku}.{accel_note} {s.evidence}"
+                    ),
+                    "sku": s.matched_sku,
+                })
+
+        # ── New product opportunity (info) ───────────────────────────────────
+        if is_new_opportunity:
+            alerts.append({
+                "level": "info",
+                "message": (
+                    f"NEW PRODUCT OPPORTUNITY: '{s.keyword}' trending "
+                    f"(score={s.score:.2f}, {s.direction}) on {s.platform} "
+                    f"— no catalog match. Evidence: {s.evidence}"
+                ),
+                "sku": None,
+            })
+
+    # ── Node 2's own failure becomes an operational warning alert here ────────
+    agent_error = state.get("agent_error")
+    if agent_error:
+        alerts.append({
+            "level": "warning",
+            "message": (
+                f"Trend agent failed this run: {agent_error}. "
+                "Check social-mcp (:8002) and trends-mcp (:8003) health."
+            ),
+            "sku": None,
+        })
+
+    n_critical = sum(1 for a in alerts if a["level"] == "critical")
+    print(
+        f"[Trend] Alerts computed: {len(computed_signals)} signals → "
+        f"{len(alerts)} alerts ({n_critical} critical, {n_suppressed} duplicate critical suppressed)."
+    )
+
+    return {"computed_signals": computed_signals, "computed_alerts": alerts}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 4 — write_state_outputs
 # ══════════════════════════════════════════════════════════════════════════════
 
 def write_state_outputs(state: TrendAgentState) -> dict:
     """
-    Deserializes _TrendAnalysis JSON → typed TrendSignal + AgentAlert dicts.
-    New product opportunity signals get their own "info" alert.
-    operator.add semantics → safe merge with other agents' outputs.
+    Converts Node 3's plain dicts into typed TrendSignal + AgentAlert state
+    objects. All judgment happened in Node 2, all rule application happened
+    in Node 3 — this node is now a type-safe passthrough, the same shape as
+    every other agent's final write node. operator.add semantics → safe
+    merge with other agents' outputs.
     """
-    analysis = TrendAnalysis.model_validate_json(state["raw_analysis"])
-    now_iso  = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     trend_signals: list[TrendSignal] = [
         TrendSignal(
-            keyword     = s.keyword,
-            platform    = s.platform,
-            score       = s.score,
-            direction   = s.direction,
-            matched_sku = s.matched_sku,
+            keyword=s["keyword"], platform=s["platform"], score=s["score"],
+            direction=s["direction"], matched_sku=s["matched_sku"], evidence=s["evidence"],
+            is_new_product_opportunity=s["is_new_product_opportunity"],
+            score_delta=s["score_delta"],
         )
-        for s in analysis.trend_signals
+        for s in state.get("computed_signals", [])
     ]
 
     alerts: list[AgentAlert] = [
         AgentAlert(
-            level      = a.level,
-            agent      = "trend_agent",
-            message    = a.message,
-            sku        = a.sku,
-            created_at = now_iso,
+            level=a["level"], agent="trend_agent", message=a["message"],
+            sku=a["sku"], created_at=now_iso,
         )
-        for a in analysis.alerts
+        for a in state.get("computed_alerts", [])
     ]
-
-    # Extra "info" alert per new product opportunity
-    for sig in analysis.trend_signals:
-        if sig.is_new_product_opportunity:
-            alerts.append(AgentAlert(
-                level      = "info",
-                agent      = "trend_agent",
-                message    = (
-                    f"NEW PRODUCT OPPORTUNITY: '{sig.keyword}' trending "
-                    f"(score={sig.score:.2f}, {sig.direction}) on {sig.platform} "
-                    f"— no catalog match. Evidence: {sig.evidence}"
-                ),
-                sku        = None,
-                created_at = now_iso,
-            ))
 
     print(
         f"[Trend] Written {len(trend_signals)} trend signals, "
@@ -344,12 +671,16 @@ def write_state_outputs(state: TrendAgentState) -> dict:
 def build_trend_graph() -> StateGraph:
     graph = StateGraph(TrendAgentState)
 
-    graph.add_node("run_react_agent",     run_react_agent)
-    graph.add_node("write_state_outputs", write_state_outputs)
+    graph.add_node("fetch_trend_history",  fetch_trend_history)
+    graph.add_node("run_react_agent",      run_react_agent)
+    graph.add_node("compute_trend_alerts", compute_trend_alerts)
+    graph.add_node("write_state_outputs",  write_state_outputs)
 
-    graph.add_edge(START,                 "run_react_agent")
-    graph.add_edge("run_react_agent",     "write_state_outputs")
-    graph.add_edge("write_state_outputs", END)
+    graph.add_edge(START,                   "fetch_trend_history")
+    graph.add_edge("fetch_trend_history",   "run_react_agent")
+    graph.add_edge("run_react_agent",       "compute_trend_alerts")
+    graph.add_edge("compute_trend_alerts",  "write_state_outputs")
+    graph.add_edge("write_state_outputs",   END)
 
     return graph.compile()
 
@@ -360,7 +691,9 @@ trend_graph = build_trend_graph()
 # ══════════════════════════════════════════════════════════════════════════════
 # Standalone test
 # python -m agents.trend.graph
-# (requires social-mcp on :8002 and trends-mcp on :8003)
+# (requires social-mcp on :8002 and trends-mcp on :8003; DB history lookup is
+#  non-fatal if Postgres isn't reachable locally — it just logs and continues
+#  with an empty history)
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -368,29 +701,52 @@ if __name__ == "__main__":
 
     async def _test_run():
         print("\n" + "═" * 60)
-        print("  FashionOS — Trend Agent (ReAct) Test Run")
+        print("  FashionOS — Trend Agent (ReAct + memory + alerts + catalog search) Test Run")
         print("═" * 60 + "\n")
 
+        # Small mock catalog so search_catalog has something real to match
+        # against when running this file standalone.
+        mock_products = [
+            {
+                "title": "Olive Cargo Pants", "tags": "bottoms, casual, unisex",
+                "variants": [{"sku": "FOS-001-S", "title": "Small"}],
+            },
+            {
+                "title": "Beige Linen Co-ord Set", "tags": "co-ord, linen, summer",
+                "variants": [{"sku": "FOS-005-M", "title": "Medium"}],
+            },
+            {
+                "title": "Pink Chiffon Kurta", "tags": "kurta, formal, chiffon",
+                "variants": [{"sku": "FOS-002-S", "title": "Small"}],
+            },
+        ]
+
         initial_state: TrendAgentState = {
-            "brand_id":      os.getenv("BRAND_ID",   "test-brand-001"),
-            "brand_name":    os.getenv("BRAND_NAME", "TestBrand"),
-            "products":      [],   # Empty = no SKU matching, agent still finds trends
-            "raw_analysis":  "",
-            "trend_signals": [],
-            "alerts":        [],
+            "brand_id":         os.getenv("BRAND_ID",   "test-brand-001"),
+            "brand_name":       os.getenv("BRAND_NAME", "TestBrand"),
+            "products":         mock_products,
+            "trend_history":    [],
+            "raw_findings":     "",
+            "agent_error":      None,
+            "computed_signals": [],
+            "computed_alerts":  [],
+            "trend_signals":    [],
+            "alerts":           [],
         }
 
         result = await trend_graph.ainvoke(initial_state)
 
         print("\n── TREND SIGNALS ──────────────────────────────────────────────")
         for sig in sorted(result["trend_signals"], key=lambda s: -s["score"]):
+            delta_tag = f"  Δ{sig['score_delta']:+.2f}" if sig.get("score_delta") is not None else "  (new)"
             print(
                 f"  {sig['platform'].upper():<14} "
-                f"score={sig['score']:.2f}  "
+                f"score={sig['score']:.2f}{delta_tag}  "
                 f"{sig['direction']:<10} "
                 f"'{sig['keyword']}'  "
                 f"→ {sig.get('matched_sku') or '(no catalog match)'}"
             )
+            print(f"    evidence: {sig.get('evidence', '')[:120]}")
 
         print("\n── ALERTS ─────────────────────────────────────────────────────")
         for alert in result["alerts"]:

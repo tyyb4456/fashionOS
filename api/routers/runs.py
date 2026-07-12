@@ -46,6 +46,7 @@ from db.schemas import (
     RunDetailSchema,
     RunSummarySchema,
     SeasonalContextSchema,
+    TrendSignalSchema,
 )
 from agents.seasonal import current_seasonal_context
 from db.session import get_session
@@ -98,6 +99,7 @@ async def get_run(
     content         = await crud.get_run_content(session, run_id=run_id)
     return_insights = await crud.get_run_return_insights(session, run_id=run_id)
     dm_replies      = await crud.get_run_dm_replies(session, run_id=run_id)
+    trend_signals   = await crud.get_run_trend_signals(session, run_id=run_id)
 
     detail = RunDetailSchema.model_validate(run)
     detail.inventory_snapshots = [InventorySnapshotSchema.model_validate(s) for s in snapshots]
@@ -107,6 +109,7 @@ async def get_run(
     detail.content_posts       = [ContentPostSchema.model_validate(c) for c in content]
     detail.return_insights     = [ReturnInsightSchema.model_validate(r) for r in return_insights]
     detail.dm_replies          = [DMReplySchema.model_validate(d) for d in dm_replies]
+    detail.trend_signals       = [TrendSignalSchema.model_validate(t) for t in trend_signals]
 
     return detail
 
@@ -208,6 +211,27 @@ async def get_run_dm_replies_endpoint(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
     records = await crud.get_run_dm_replies(session, run_id=run_id)
     return [DMReplySchema.model_validate(r) for r in records]
+
+
+@router.get(
+    "/runs/{run_id}/trends",
+    response_model=list[TrendSignalSchema],
+    summary="Get trend signals for a run",
+    description="All trend signals raised by the Trend Agent in a specific run, highest score first.",
+)
+async def get_run_trend_signals_endpoint(
+    run_id:  str,
+    brand:   Brand = Depends(get_current_brand),
+    session: AsyncSession = Depends(get_session),
+) -> list[TrendSignalSchema]:
+    run = await crud.get_run(session, run_id=run_id)
+    if not run:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+    if run.brand_id != brand.brand_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this run.")
+    records = await crud.get_run_trend_signals(session, run_id=run_id)
+    return [TrendSignalSchema.model_validate(r) for r in records]
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,6 +359,25 @@ async def get_flagged_dms_endpoint(
 ) -> list[DMReplySchema]:
     records = await crud.get_flagged_dms(session, brand_id=brand.brand_id, status=status_, limit=limit)
     return [DMReplySchema.model_validate(r) for r in records]
+
+
+@router.get(
+    "/trends/recent",
+    response_model=list[TrendSignalSchema],
+    summary="Get recent trend signals",
+    description=(
+        "All trend signals raised across recent runs for this brand, highest "
+        "score first. Powers the Trends dashboard page and doubles as visibility "
+        "into what the Trend Agent's memory currently holds."
+    ),
+)
+async def get_recent_trend_signals_endpoint(
+    brand:   Brand = Depends(get_current_brand),
+    limit:   int          = Query(100, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+) -> list[TrendSignalSchema]:
+    records = await crud.get_trend_signals_dashboard(session, brand_id=brand.brand_id, limit=limit)
+    return [TrendSignalSchema.model_validate(r) for r in records]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

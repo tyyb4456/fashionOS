@@ -12,6 +12,7 @@ from db.models import (
     PricingActionRecord,
     RestockRecommendationRecord,
     ReturnInsightRecord,
+    TrendSignalRecord,
 )
 from db.session import AsyncSessionLocal, engine, get_session
 
@@ -25,6 +26,7 @@ __all__ = [
     "PricingActionRecord",
     "RestockRecommendationRecord",
     "ReturnInsightRecord",
+    "TrendSignalRecord",
     "AsyncSessionLocal",
     "engine",
     "get_session",
