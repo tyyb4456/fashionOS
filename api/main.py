@@ -79,6 +79,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"] if ENV == "development" else [os.getenv("DASHBOARD_URL", "")],
+    # allow_origins     = ["*"],
     allow_credentials = True,
     allow_methods     = ["*"],
     allow_headers     = ["*"],

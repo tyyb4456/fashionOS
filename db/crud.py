@@ -286,6 +286,7 @@ async def save_run(
             matched_sku                = sig.get("matched_sku"),
             evidence                   = sig.get("evidence"),
             is_new_product_opportunity = sig.get("is_new_product_opportunity", False),
+            score_delta                = sig.get("score_delta"),
         ))
 
     logger.info(

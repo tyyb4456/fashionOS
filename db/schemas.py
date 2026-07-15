@@ -243,6 +243,7 @@ class TrendSignalSchema(_Base):
     matched_sku: Optional[str]
     evidence:    Optional[str]
     is_new_product_opportunity: bool
+    score_delta: Optional[float] = None   # NEW — vs. last recorded reading
     created_at:  datetime
 
 

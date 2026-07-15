@@ -24,12 +24,15 @@ from deepagents.backends import CompositeBackend, StateBackend, StoreBackend, Fi
 from dotenv import load_dotenv
 from langgraph.store.redis.aio import AsyncRedisStore
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+from langchain.agents.middleware import ModelFallbackMiddleware
+from deep_agents.message_sanitizer import SanitizeMessagesMiddleware
 
 from deep_agents.memory import ensure_brand_seeded
 from deep_agents.prompts import build_prompt
 from deep_agents.tools.db_tools import get_db_tools
 from deep_agents.tools.pipeline_tools import get_pipeline_tools
-from deep_agents.load_model import llm
+from deep_agents.load_model import model1, model2
+from deep_agents.turn_aware_fallback import TurnAwareModelFallback
 
 load_dotenv()
 
@@ -95,8 +98,17 @@ async def build_supervisor(brand_id: str, brand_name: str):
 
     agent = create_deep_agent(
         name          = f"fashionos-{brand_id}",
-        model         = llm,
+        model         = model1,
         system_prompt = build_prompt(brand_id, brand_name),
+        middleware    = [
+            SanitizeMessagesMiddleware(),
+            TurnAwareModelFallback(
+                model2,
+                mid_loop_retries=3,
+                mid_loop_initial_delay=2.0,   # wait 2s, then 4s, then 8s
+                mid_loop_backoff_factor=2.0,
+            )
+        ],
         tools         = get_db_tools() + get_pipeline_tools(),
         backend       = backend,
         store         = store,

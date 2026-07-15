@@ -170,6 +170,18 @@ async def stream_chat(
 
             msg_chunk, _metadata = chunk
 
+            # Ollama/ChatOllama (qwen3.5 etc.) puts reasoning in additional_kwargs
+            # under "reasoning_content" — NOT as a {"type": "reasoning", ...}
+            # content block the way Kimi/Azure does further below. These two
+            # paths are mutually exclusive per-provider (a chunk from Kimi
+            # won't have reasoning_content in additional_kwargs, and a chunk
+            # from Ollama won't have reasoning blocks in content), so there's
+            # no double-counting risk running both.
+            reasoning_kw = (getattr(msg_chunk, "additional_kwargs", {}) or {}).get("reasoning_content", "")
+            if reasoning_kw:
+                reasoning_accum += reasoning_kw
+                yield {"type": "reasoning", "name": None, "content": reasoning_kw}
+
             raw = getattr(msg_chunk, "content", "") or ""
             if isinstance(raw, _PydanticBase):
                 raw = raw.model_dump_json()

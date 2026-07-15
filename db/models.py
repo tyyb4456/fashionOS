@@ -433,6 +433,11 @@ class TrendSignalRecord(Base):
 
     is_new_product_opportunity: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # NEW — deterministic alert intelligence (compute_trend_alerts). How much
+    # this signal's score moved since its last recorded reading; None if this
+    # keyword/platform pair was never seen before.
+    score_delta: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
