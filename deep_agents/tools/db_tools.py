@@ -133,10 +133,11 @@ async def get_pipeline_status(brand_id: str) -> dict:
 
 async def get_inventory_status(brand_id: str) -> dict:
     """
-    Get the full inventory health snapshot from the latest pipeline run.
-    Returns all SKUs with their stock levels, daily velocity, days remaining,
-    and urgency classification. Call this when the founder asks about inventory,
-    stock levels, which products are running low, or for a general health check.
+    Get the full inventory health snapshot from the most recent pipeline run that
+    included the inventory agent. Returns all SKUs with their stock levels, daily
+    velocity, days remaining, and urgency classification. Call this when the founder
+    asks about inventory, stock levels, which products are running low, or for a
+    general health check.
 
     Args:
         brand_id: The brand to query.
@@ -164,29 +165,35 @@ async def get_inventory_status(brand_id: str) -> dict:
     Session = _make_session()
     try:
         async with Session() as session:
-            # Get the latest run_id for this brand
-            run_result = await session.execute(
+            # Walk through recent runs (newest first) until we find one that
+            # actually has inventory snapshots. The latest run may have been a
+            # DM-only or trend-only run that skipped the inventory agent entirely.
+            runs_result = await session.execute(
                 select(AgentRun.run_id, AgentRun.completed_at)
                 .where(AgentRun.brand_id == brand_id)
                 .order_by(desc(AgentRun.created_at))
-                .limit(1)
+                .limit(20)
             )
-            row = run_result.first()
-            if not row:
+            runs = runs_result.all()
+
+            if not runs:
                 return {"error": "No pipeline runs found yet."}
 
-            run_id, completed_at = row
-
-            # Get all snapshots for that run
-            snap_result = await session.execute(
-                select(InventorySnapshotRecord)
-                .where(InventorySnapshotRecord.run_id == run_id)
-                .order_by(InventorySnapshotRecord.days_of_stock_remaining)
-            )
-            snaps = snap_result.scalars().all()
+            snaps = []
+            completed_at = None
+            for run_id, run_completed_at in runs:
+                snap_result = await session.execute(
+                    select(InventorySnapshotRecord)
+                    .where(InventorySnapshotRecord.run_id == run_id)
+                    .order_by(InventorySnapshotRecord.days_of_stock_remaining)
+                )
+                snaps = snap_result.scalars().all()
+                if snaps:
+                    completed_at = run_completed_at
+                    break
 
             if not snaps:
-                return {"error": "No inventory data found for the latest run."}
+                return {"error": "No inventory data found. The inventory agent has not run yet."}
 
             urgency_counts = {"critical": 0, "high": 0, "normal": 0, "healthy": 0}
             skus = []
@@ -246,17 +253,34 @@ async def get_critical_skus(brand_id: str) -> list[dict]:
     Session = _make_session()
     try:
         async with Session() as session:
-            run_result = await session.execute(
+            # Walk through recent runs (newest first) to find the latest one
+            # that actually has inventory snapshots (inventory agent may have
+            # been skipped on the most recent run).
+            runs_result = await session.execute(
                 select(AgentRun.run_id)
                 .where(AgentRun.brand_id == brand_id)
                 .order_by(desc(AgentRun.created_at))
-                .limit(1)
+                .limit(20)
             )
-            run_row = run_result.first()
-            if not run_row:
+            runs = runs_result.all()
+
+            if not runs:
                 return []
 
-            run_id = run_row[0]
+            run_id = None
+            for (candidate_run_id,) in runs:
+                # Check if this run has any inventory snapshots at all
+                exists_result = await session.execute(
+                    select(InventorySnapshotRecord.run_id)
+                    .where(InventorySnapshotRecord.run_id == candidate_run_id)
+                    .limit(1)
+                )
+                if exists_result.first():
+                    run_id = candidate_run_id
+                    break
+
+            if not run_id:
+                return []
 
             snap_result = await session.execute(
                 select(InventorySnapshotRecord)

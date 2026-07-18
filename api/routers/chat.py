@@ -58,7 +58,7 @@ class ConversationMeta(BaseModel):
 class ToolResultOut(BaseModel):
     name:    str
     summary: str
-    data:    dict | None = None
+    data:    list | dict | None = None
     status:  str = "done"
 
 

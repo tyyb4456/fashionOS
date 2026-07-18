@@ -77,16 +77,17 @@ async def _save_tool_result(
     tool_name: str,
     summary: str,
     data: dict,
+    call_seq: int = 0,
 ) -> None:
     """
     Fire-and-forget: persist one tool result row so the frontend can render a
-    chat_tool_results (see db/models.py) so the frontend can render a rich card
-    when conversation history is reloaded, not just prose.
+    rich card when conversation history is reloaded, not just prose.
 
-    Reuses chat_tool_results unchanged — no migration needed. For
-    check_agent_analysis_status, agent_name holds the real FashionOS agents
-    that ran (e.g. "inventory,trend,pricing") instead of the generic tool name
-    — more useful to a human scanning history later.
+    call_seq: 0-based counter of how many times this tool_name has already
+    been persisted in this turn. When > 0, a "#N" suffix is appended to the
+    label so duplicate tool calls (e.g. get_inventory_status called twice)
+    each get a unique label and are ALL saved — previously the 2nd+ call
+    would silently fail if the DB row already existed for that label.
     """
     from db.session import AsyncSessionLocal
     from db.models  import ChatToolResult
@@ -96,6 +97,17 @@ async def _save_tool_result(
         completed = (data.get("result") or {}).get("completed_agents")
         if completed:
             label = ",".join(completed)
+
+    # Append a sequence suffix so two calls to the same tool in one turn
+    # produce different labels (e.g. "get_inventory_status" vs
+    # "get_inventory_status#2").  Without this the second INSERT either
+    # violates a unique constraint or overwrites the first row — either way
+    # the second tool card disappears on page reload.
+    if call_seq > 0:
+        label = f"{label}#{call_seq + 1}"
+
+    # Truncate to fit the label column (255 chars in DB).
+    label = label[:255]
 
     if not isinstance(summary, str):
         if isinstance(summary, dict):
@@ -113,7 +125,7 @@ async def _save_tool_result(
             ))
             await session.commit()
     except Exception as exc:
-        print(f"[Streaming] ⚠ Failed to persist tool result ({tool_name}): {exc}")
+        print(f"[Streaming] ⚠ Failed to persist tool result ({tool_name} seq={call_seq}): {exc}")
 
 
 # ── Non-streaming chat ──────────────────────────────────────────────────────
@@ -166,6 +178,10 @@ async def stream_chat(
     # result when it streams back on a LATER chunk.
     tc_id_to_tool: dict[str, str] = {}
     reasoning_accum = ""   # full reasoning text for this turn — saved once the stream ends
+
+    # Tracks how many times each tool name has been persisted this turn so
+    # duplicate calls (e.g. get_inventory_status × 2) each get a unique label.
+    tool_persist_count: dict[str, int] = {}
 
     try:
         async for chunk in agent.astream(
@@ -263,13 +279,24 @@ async def stream_chat(
 
                 yield {"type": "tool_result", "name": tool_name, "id": tc_id, "data": parsed}
 
-                if tool_name in PERSISTABLE_TOOLS and isinstance(parsed, dict) and "error" not in parsed:
-                    summary_raw = (
-                        parsed.get("run_summary")
-                        or (parsed.get("result") or {}).get("run_summary")
-                        or parsed.get("summary")
-                        or ""
-                    )
+                is_valid_result = False
+                if tool_name in PERSISTABLE_TOOLS:
+                    if isinstance(parsed, dict) and "error" not in parsed:
+                        is_valid_result = True
+                    elif isinstance(parsed, list):
+                        is_valid_result = True
+
+                if is_valid_result:
+                    if isinstance(parsed, dict):
+                        summary_raw = (
+                            parsed.get("run_summary")
+                            or (parsed.get("result") or {}).get("run_summary")
+                            or parsed.get("summary")
+                            or ""
+                        )
+                    else:
+                        summary_raw = f"{len(parsed)} items"
+
                     if isinstance(summary_raw, dict):
                         summary_text = ", ".join(f"{k}: {v}" for k, v in summary_raw.items())
                     elif isinstance(summary_raw, list):
@@ -277,9 +304,16 @@ async def stream_chat(
                     else:
                         summary_text = str(summary_raw)
 
+                    # Determine the sequence number for this tool call within
+                    # the current turn so duplicate calls get unique labels.
+                    persist_key = tool_name
+                    call_seq = tool_persist_count.get(persist_key, 0)
+                    tool_persist_count[persist_key] = call_seq + 1
+
                     asyncio.ensure_future(_save_tool_result(
                         brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
                         tool_name=tool_name, summary=summary_text, data=parsed,
+                        call_seq=call_seq,
                     ))
 
                 continue  # never emit raw tool JSON as chat tokens

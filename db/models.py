@@ -471,7 +471,7 @@ class ChatToolResult(Base):
     # Human-readable label for this row: a tool name (get_inventory_status),
     # a comma-joined list of pipeline agents that ran (inventory,trend,pricing),
     # or the reasoning sentinel (see deep_agents/streaming.py REASONING_SENTINEL).
-    label: Mapped[str] = mapped_column(String(100), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
 
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     data:    Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
