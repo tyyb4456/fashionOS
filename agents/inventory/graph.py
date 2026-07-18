@@ -57,7 +57,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from langchain.chat_models import init_chat_model
+from langchain_sambanova import ChatSambaNova
 
 from agents.skills import load_skill
 from agents.seasonal import current_seasonal_context
@@ -71,7 +71,14 @@ from response_schemas.inventory_model import SnapshotOut, InventoryAlertsAndSumm
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 SHOPIFY_MCP_URL = os.getenv("SHOPIFY_MCP_URL", "http://localhost:8001/mcp")
-model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+
+model = ChatSambaNova(
+    model="Meta-Llama-3.3-70B-Instruct",
+    max_tokens=1024,
+    temperature=0.7,
+    top_p=0.01,
+    # other params...
+)
 
 DEFAULT_LEAD_TIME_DAYS = int(os.getenv("INVENTORY_DEFAULT_LEAD_DAYS", "10"))
 SAFETY_BUFFER_DAYS     = int(os.getenv("INVENTORY_SAFETY_BUFFER_DAYS", "7"))

@@ -97,6 +97,14 @@ async def _save_tool_result(
         if completed:
             label = ",".join(completed)
 
+    if not isinstance(summary, str):
+        if isinstance(summary, dict):
+            summary = ", ".join(f"{k}: {v}" for k, v in summary.items())
+        elif isinstance(summary, list):
+            summary = ", ".join(str(item) for item in summary)
+        else:
+            summary = str(summary) if summary is not None else ""
+
     try:
         async with AsyncSessionLocal() as session:
             session.add(ChatToolResult(
@@ -170,17 +178,17 @@ async def stream_chat(
 
             msg_chunk, _metadata = chunk
 
-            # Ollama/ChatOllama (qwen3.5 etc.) puts reasoning in additional_kwargs
-            # under "reasoning_content" — NOT as a {"type": "reasoning", ...}
-            # content block the way Kimi/Azure does further below. These two
-            # paths are mutually exclusive per-provider (a chunk from Kimi
-            # won't have reasoning_content in additional_kwargs, and a chunk
-            # from Ollama won't have reasoning blocks in content), so there's
-            # no double-counting risk running both.
-            reasoning_kw = (getattr(msg_chunk, "additional_kwargs", {}) or {}).get("reasoning_content", "")
-            if reasoning_kw:
-                reasoning_accum += reasoning_kw
-                yield {"type": "reasoning", "name": None, "content": reasoning_kw}
+            # # Ollama/ChatOllama (qwen3.5 etc.) puts reasoning in additional_kwargs
+            # # under "reasoning_content" — NOT as a {"type": "reasoning", ...}
+            # # content block the way Kimi/Azure does further below. These two
+            # # paths are mutually exclusive per-provider (a chunk from Kimi
+            # # won't have reasoning_content in additional_kwargs, and a chunk
+            # # from Ollama won't have reasoning blocks in content), so there's
+            # # no double-counting risk running both.
+            # reasoning_kw = (getattr(msg_chunk, "additional_kwargs", {}) or {}).get("reasoning_content", "")
+            # if reasoning_kw:
+            #     reasoning_accum += reasoning_kw
+            #     yield {"type": "reasoning", "name": None, "content": reasoning_kw}
 
             raw = getattr(msg_chunk, "content", "") or ""
             if isinstance(raw, _PydanticBase):
@@ -188,7 +196,8 @@ async def stream_chat(
 
             # ── Split content blocks: reasoning vs. text ────────────────────
             # Some providers return a list of content blocks:
-            #   {"type": "reasoning", "summary": [{"text": "..."}]}
+            #   {"type": "reasoning", "summary": [{"text": "..."}]}                  ← Kimi/Azure (model1)
+            #   {"type": "thinking", "thinking": [{"type": "text", "text": "..."}]}  ← Mistral (model2, reasoning_effort="high")
             #   {"type": "text", "text": "..."}
             # Others just return a plain string — handled by the else branch.
             if isinstance(raw, list):
@@ -201,6 +210,11 @@ async def stream_chat(
                                 reasoning_parts.append(s.get("text", "") if isinstance(s, dict) else str(s))
                             if c.get("text"):
                                 reasoning_parts.append(c["text"])
+                        elif block_type == "thinking":
+                            # Mistral ThinkChunk — "thinking" is a list of TextChunk
+                            # objects, not a plain string like Kimi's "summary".
+                            for s in c.get("thinking", []) or []:
+                                reasoning_parts.append(s.get("text", "") if isinstance(s, dict) else str(s))
                         elif block_type == "text":
                             text_parts.append(c.get("text", ""))
                         elif "text" in c:
@@ -250,12 +264,19 @@ async def stream_chat(
                 yield {"type": "tool_result", "name": tool_name, "id": tc_id, "data": parsed}
 
                 if tool_name in PERSISTABLE_TOOLS and isinstance(parsed, dict) and "error" not in parsed:
-                    summary_text = (
+                    summary_raw = (
                         parsed.get("run_summary")
                         or (parsed.get("result") or {}).get("run_summary")
                         or parsed.get("summary")
                         or ""
                     )
+                    if isinstance(summary_raw, dict):
+                        summary_text = ", ".join(f"{k}: {v}" for k, v in summary_raw.items())
+                    elif isinstance(summary_raw, list):
+                        summary_text = ", ".join(str(item) for item in summary_raw)
+                    else:
+                        summary_text = str(summary_raw)
+
                     asyncio.ensure_future(_save_tool_result(
                         brand_id=brand_id, thread_id=thread_id, turn_index=turn_index,
                         tool_name=tool_name, summary=summary_text, data=parsed,

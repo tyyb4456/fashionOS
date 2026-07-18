@@ -97,12 +97,22 @@ TRENDS_MCP_URL = os.getenv("TRENDS_MCP_URL", "http://localhost:8003/mcp")
 
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 
-if GOOGLE_CLOUD_PROJECT:
-    model = init_chat_model("google_vertexai:gemini-2.5-flash")
-    print(f"[Trend] Using Vertex AI (project={GOOGLE_CLOUD_PROJECT}) ← hackathon mode.")
-else:
-    model = init_chat_model("google_genai:gemini-2.5-flash-lite")
-    print("[Trend] GOOGLE_CLOUD_PROJECT not set — using google_genai (local dev).")
+# if GOOGLE_CLOUD_PROJECT:
+#     model = init_chat_model("google_vertexai:gemini-2.5-flash")
+#     print(f"[Trend] Using Vertex AI (project={GOOGLE_CLOUD_PROJECT}) ← hackathon mode.")
+# else:
+#     model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+#     print("[Trend] GOOGLE_CLOUD_PROJECT not set — using google_genai (local dev).")
+
+from langchain_sambanova import ChatSambaNova
+
+model = ChatSambaNova(
+    model="Meta-Llama-3.3-70B-Instruct",
+    max_tokens=1024,
+    temperature=0.7,
+    top_p=0.01,
+    # other params...
+)
 
 TREND_HISTORY_LOOKBACK_DAYS = int(os.getenv("TREND_HISTORY_LOOKBACK_DAYS", "3"))
 TREND_REALERT_SCORE_DELTA   = float(os.getenv("TREND_REALERT_SCORE_DELTA", "0.15"))
@@ -130,8 +140,10 @@ class TrendAgentState(TypedDict):
     raw_findings: str           # Node 2 output — serialized TrendFindings JSON (signals only)
     agent_error:  Optional[str] # Node 2 output — set if the ReAct loop itself failed
 
-    computed_signals: list[dict]   # Node 3 output — signals + is_new_product_opportunity + score_delta
-    computed_alerts:  list[dict]   # Node 3 output — {level, message, sku} dicts
+    trends_context: dict        # Node 3 output — {keyword.lower(): google_trends_data}
+
+    computed_signals: list[dict]   # Node 4 output — signals + is_new_product_opportunity + score_delta
+    computed_alerts:  list[dict]   # Node 4 output — {level, message, sku} dicts
 
     # operator.add → safe merge when Supervisor combines agent outputs
     trend_signals: Annotated[list[TrendSignal], operator.add]
@@ -321,22 +333,25 @@ async def run_react_agent(state: TrendAgentState) -> dict:
       9. Produces a TrendFindings via response_format — signals ONLY.
          Alert eligibility is computed downstream (Node 3), not here.
     """
-    # ── Get tools from both MCP servers ───────────────────────────────────────
+    # ── Get tools from social-mcp only ────────────────────────────────────────
+    # trends-mcp is intentionally excluded from the ReAct loop. Google Trends
+    # cross-referencing now runs in a fixed Node 3 (cross_reference_trends)
+    # AFTER the agent loop, freeing ~2-3 tool-call budget slots for more
+    # social scraping — which is where the real signal quality comes from.
     social_client = MultiServerMCPClient(
         {"social": {"url": SOCIAL_MCP_URL, "transport": "http"}}
     )
-    trends_client = MultiServerMCPClient(
-        {"trends": {"url": TRENDS_MCP_URL, "transport": "http"}}
-    )
 
     social_tools = await social_client.get_tools()
-    trends_tools = await trends_client.get_tools()
 
-    # Exclude DM tools — they require brand_id and are not relevant here.
-    # Trend Agent only needs the scraping + trends tools.
+    # Exclude DM tools — brand_id required, irrelevant to trend research.
+    # Include batch tools so the agent can sweep multiple hashtags in one call.
     scraping_tools = [
         t for t in social_tools
-        if t.name in ("search_tiktok_hashtag", "search_instagram_hashtag", "get_trending_tiktok_sounds")
+        if t.name in (
+            "search_tiktok_hashtag", "search_tiktok_hashtags_batch",
+            "search_instagram_hashtag", "get_trending_tiktok_sounds",
+        )
     ]
 
     skill_content = load_skill("fashion_trend")
@@ -346,7 +361,7 @@ async def run_react_agent(state: TrendAgentState) -> dict:
     # search_catalog is bound per-run to the FULL catalog via closure — not
     # an MCP tool, pure local computation, no truncation.
     search_catalog_tool = _make_search_catalog_tool(catalog)
-    all_tools = scraping_tools + list(trends_tools) + [search_catalog_tool]
+    all_tools = scraping_tools + [search_catalog_tool]
 
     print(f"[Trend] ReAct tools: {[t.name for t in all_tools]}")
 
@@ -387,18 +402,22 @@ THIN/BAD SIGNAL (discard, try a different hashtag):
 If bad: choose a MORE SPECIFIC or DIFFERENT hashtag and retry immediately.
 Do NOT include thin data in your final analysis.
 
-### Step 3 — Cross-reference with Google Trends
-Once you have 2+ good social signals, use compare_keywords() or get_related_queries()
-to verify in Pakistan search volume. This confirms the trend is real, not just viral noise.
-direction="rising" + avg_interest > 30 = strong confirmation.
+### Step 3 — Stop when satisfied (read carefully — these are hard rules)
 
-### Step 4 — Stop when satisfied
+Hard retry cap: You may retry a **bad hashtag at most 3 times total** across both
+platforms combined. After 3 failed/thin attempts, move on — do NOT keep retrying.
+
 Stop iterating when ANY of these is true:
-  - You have 3-5 strong signals with engagement above thresholds
-  - You have searched 6-8 total hashtags (enough breadth)
-  - You have confirmed 2+ rising trends via Google Trends cross-reference
+  - You have 2+ good signals with engagement above thresholds AND you have called
+    search_catalog for each of them (preferred exit — quality run)
+  - You have made 10+ tool calls total, regardless of signal quality (budget exit —
+    write whatever you have and stop, even if signals are thin)
 
-Do NOT keep searching indefinitely. Quality over quantity.
+Do NOT keep searching indefinitely. If you have SOME good signals, stop and write them.
+A partial result is always better than hitting the recursion ceiling with nothing.
+IMPORTANT: You do NOT have access to compare_keywords, get_trend_data, or any Google
+Trends tool. Those run automatically in a fixed Python step AFTER your loop completes.
+Focus only on: TikTok/Instagram scraping + search_catalog. That's your entire toolkit.
 
 ## SCORING
 0.8-1.0  Very high engagement, rising, confirmed on 2+ platforms
@@ -469,7 +488,7 @@ score/direction/matched_sku:
     try:
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=user_message)]},
-            config={"recursion_limit": 20},   # ~25 tool-call iterations max
+            config={"recursion_limit": 50},   # ~25 tool-call iterations max; was 20 (too tight)
         )
         findings: TrendFindings = result["structured_response"]
 
@@ -497,7 +516,75 @@ score/direction/matched_sku:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — compute_trend_alerts (deterministic, no LLM)
+# NODE 3 — cross_reference_trends (fixed Python, no LLM — calls trends-mcp)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def cross_reference_trends(state: TrendAgentState) -> dict:
+    """
+    Calls trends-mcp's compare_keywords on the agent's top-scored keywords.
+    Runs OUTSIDE the ReAct loop, so zero node budget is consumed by this step.
+
+    Frees up ~2-3 tool-call slots that the agent previously burned calling
+    compare_keywords / get_trend_data mid-loop, while still enriching every
+    signal with Google Trends data before compute_trend_alerts runs.
+    Non-fatal: rate-limit or network error → empty dict, pipeline continues.
+    """
+    raw = state.get("raw_findings") or '{"trend_signals": [], "summary": ""}'
+    findings = TrendFindings.model_validate_json(raw)
+
+    if not findings.trend_signals:
+        return {"trends_context": {}}
+
+    # Deduplicate and take the top-5 keywords by score (Google Trends API limit)
+    seen: set[str] = set()
+    keywords: list[str] = []
+    for s in sorted(findings.trend_signals, key=lambda x: -x.score):
+        kw = s.keyword.lower()
+        if kw not in seen:
+            seen.add(kw)
+            keywords.append(s.keyword)
+        if len(keywords) == 5:
+            break
+
+    print(f"[Trend] Google Trends cross-reference: {keywords}")
+
+    try:
+        trends_client = MultiServerMCPClient(
+            {"trends": {"url": TRENDS_MCP_URL, "transport": "http"}}
+        )
+        trends_tools = await trends_client.get_tools()
+        compare_tool  = next((t for t in trends_tools if t.name == "compare_keywords"), None)
+
+        if not compare_tool:
+            print("[Trend] compare_keywords not found in trends-mcp — skipping.")
+            return {"trends_context": {}}
+
+        raw_result = await compare_tool.ainvoke({"keywords": keywords})
+
+        # langchain_mcp_adapters returns the tool output as a JSON string or a list
+        if isinstance(raw_result, str):
+            result_list = json.loads(raw_result)
+        elif isinstance(raw_result, list):
+            result_list = raw_result
+        else:
+            result_list = []
+
+        context = {
+            r["keyword"].lower(): r
+            for r in result_list
+            if isinstance(r, dict) and "keyword" in r
+        }
+        print(f"[Trend] Google Trends enriched {len(context)}/{len(keywords)} keywords.")
+
+    except Exception as exc:
+        print(f"[Trend] Google Trends cross-reference failed (non-fatal): {exc}")
+        context = {}
+
+    return {"trends_context": context}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 4 — compute_trend_alerts (deterministic, no LLM)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_trend_alerts(state: TrendAgentState) -> dict:
@@ -522,6 +609,8 @@ def compute_trend_alerts(state: TrendAgentState) -> dict:
         (h["keyword"].lower(), h["platform"]): h
         for h in state.get("trend_history", [])
     }
+    # Google Trends enrichment from Node 3 (cross_reference_trends) — keyed by keyword.lower()
+    trends_context = state.get("trends_context", {})
 
     computed_signals: list[dict] = []
     alerts: list[dict] = []
@@ -548,9 +637,17 @@ def compute_trend_alerts(state: TrendAgentState) -> dict:
                 and prior["matched_sku"] is not None
             )
 
+        # Enrich evidence with Google Trends data from Node 3 (if available)
+        gt = trends_context.get(s.keyword.lower())
+        gt_note = (
+            f" | Google Trends (PK): avg={gt.get('avg_interest', '?')}, "
+            f"latest={gt.get('latest_interest', '?')}, direction={gt.get('direction', '?')}"
+        ) if gt else ""
+
         computed_signals.append({
             "keyword": s.keyword, "platform": s.platform, "score": s.score,
-            "direction": s.direction, "matched_sku": s.matched_sku, "evidence": s.evidence,
+            "direction": s.direction, "matched_sku": s.matched_sku,
+            "evidence": s.evidence + gt_note,
             "is_new_product_opportunity": is_new_opportunity, "score_delta": score_delta,
         })
 
@@ -622,7 +719,7 @@ def compute_trend_alerts(state: TrendAgentState) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 4 — write_state_outputs
+# NODE 5 — write_state_outputs
 # ══════════════════════════════════════════════════════════════════════════════
 
 def write_state_outputs(state: TrendAgentState) -> dict:
@@ -671,16 +768,18 @@ def write_state_outputs(state: TrendAgentState) -> dict:
 def build_trend_graph() -> StateGraph:
     graph = StateGraph(TrendAgentState)
 
-    graph.add_node("fetch_trend_history",  fetch_trend_history)
-    graph.add_node("run_react_agent",      run_react_agent)
-    graph.add_node("compute_trend_alerts", compute_trend_alerts)
-    graph.add_node("write_state_outputs",  write_state_outputs)
+    graph.add_node("fetch_trend_history",    fetch_trend_history)
+    graph.add_node("run_react_agent",        run_react_agent)
+    graph.add_node("cross_reference_trends", cross_reference_trends)
+    graph.add_node("compute_trend_alerts",   compute_trend_alerts)
+    graph.add_node("write_state_outputs",    write_state_outputs)
 
-    graph.add_edge(START,                   "fetch_trend_history")
-    graph.add_edge("fetch_trend_history",   "run_react_agent")
-    graph.add_edge("run_react_agent",       "compute_trend_alerts")
-    graph.add_edge("compute_trend_alerts",  "write_state_outputs")
-    graph.add_edge("write_state_outputs",   END)
+    graph.add_edge(START,                     "fetch_trend_history")
+    graph.add_edge("fetch_trend_history",     "run_react_agent")
+    graph.add_edge("run_react_agent",         "cross_reference_trends")
+    graph.add_edge("cross_reference_trends",  "compute_trend_alerts")
+    graph.add_edge("compute_trend_alerts",    "write_state_outputs")
+    graph.add_edge("write_state_outputs",     END)
 
     return graph.compile()
 
@@ -728,6 +827,7 @@ if __name__ == "__main__":
             "trend_history":    [],
             "raw_findings":     "",
             "agent_error":      None,
+            "trends_context":   {},
             "computed_signals": [],
             "computed_alerts":  [],
             "trend_signals":    [],

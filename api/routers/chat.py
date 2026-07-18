@@ -63,10 +63,10 @@ class ToolResultOut(BaseModel):
 
 
 class MessageOut(BaseModel):
-    role:      str   # "user" | "assistant"
-    content:   str
-    subagents: list[ToolResultOut] = []
-    reasoning: str = ""
+    role:         str   # "user" | "assistant"
+    content:      str
+    tool_results: list[ToolResultOut] = []
+    reasoning:    str = ""
 
 
 # ── Non-streaming chat ─────────────────────────────────────────────────────────

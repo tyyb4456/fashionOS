@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Optional
 import operator
 
-from langchain.chat_models import init_chat_model
+from langchain_sambanova import ChatSambaNova
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, START, StateGraph
@@ -91,7 +91,15 @@ load_dotenv()
 
 ADS_MCP_URL = os.getenv("ADS_MCP_URL", "http://localhost:8004/mcp")
 
-model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+
+
+model = ChatSambaNova(
+    model="Meta-Llama-3.3-70B-Instruct",
+    # max_tokens=1024,
+    temperature=0.7,
+    top_p=0.01,
+    # other params...
+)
 
 TRENDING_INCREASE_PCT   = float(os.getenv("MARKETING_TRENDING_INCREASE_PCT",  "25.0"))
 ORGANIC_VIRAL_DECREASE  = float(os.getenv("MARKETING_ORGANIC_VIRAL_DECREASE", "30.0"))

@@ -98,17 +98,37 @@ from response_schemas.content_model import ContentCopyPlan, ContentPlanItem
 from dotenv import load_dotenv
 load_dotenv()
 
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
+# GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 
-if GOOGLE_CLOUD_PROJECT:
-    model = init_chat_model("google_vertexai:gemini-2.5-flash")
-    print(f"[Content] Using Vertex AI (project={GOOGLE_CLOUD_PROJECT}) ← hackathon mode.")
-else:
-    model = init_chat_model("google_genai:gemini-2.5-flash-lite")
-    print("[Content] GOOGLE_CLOUD_PROJECT not set — using google_genai (local dev mode).")
+# if GOOGLE_CLOUD_PROJECT:
+#     model = init_chat_model("google_vertexai:gemini-2.5-flash")
+#     print(f"[Content] Using Vertex AI (project={GOOGLE_CLOUD_PROJECT}) ← hackathon mode.")
+# else:
+#     model = init_chat_model("google_genai:gemini-2.5-flash-lite")
+#     print("[Content] GOOGLE_CLOUD_PROJECT not set — using google_genai (local dev mode).")
+
+
+
+
+llm = HuggingFaceEndpoint(
+    repo_id="zai-org/GLM-5.2",
+    task="text-generation",
+    max_new_tokens=2048,
+    do_sample=False,
+    repetition_penalty=1.03,
+    provider="auto"
+)
+
+model = ChatHuggingFace(llm=llm)
 
 MAX_CANDIDATES      = int(os.getenv("CONTENT_MAX_CANDIDATES",   "5"))
 MAX_TRENDING        = int(os.getenv("CONTENT_MAX_TRENDING",      "3"))
@@ -490,15 +510,19 @@ Generate one entry per candidate below. Every field is required. Never omit one.
         "Write the caption, TikTok script, and creator notes for each candidate above."
     )
 
-    structured_llm = model.with_structured_output(ContentCopyPlan)
-    copy_plan: ContentCopyPlan = await structured_llm.ainvoke([
+    dict_schema = convert_to_openai_tool(ContentCopyPlan)
+
+    structured_llm = model.with_structured_output(dict_schema, include_raw=True)
+    copy_plan = await structured_llm.ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_msg),
     ])
 
-    print(f"[Content] Copy generated for {len(copy_plan.items)} candidates. Summary: {copy_plan.summary}")
+    parsed = ContentCopyPlan.model_validate(copy_plan["parsed"])
 
-    return {"raw_copy": copy_plan.model_dump_json()}
+    print(f"[Content] Copy generated for {len(parsed.items)} candidates. Summary: {parsed.summary}")
+
+    return {"raw_copy": parsed.model_dump_json()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

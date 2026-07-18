@@ -5,13 +5,22 @@ Turn-aware model fallback — replaces bare ModelFallbackMiddleware(model2).
 
 Problem with ModelFallbackMiddleware: it swaps models on ANY failed model
 call, including calls in the middle of a tool-use loop. That hands the
-fallback model (Ollama/qwen) message history it didn't produce and no shared
-plan — it doesn't know what the primary model (Kimi) was mid-way through
-doing, so it improvises: re-calling tools redundantly, or answering a
-different implicit question instead of finishing the pending step. This is
-exactly what happened with the "call me Tuddy" -> read_memory -> edit_file
-flow: Kimi started the memory update, failed on the NEXT call, and qwen
-picked up with no memory of what Kimi was doing.
+-fallback model (Ollama/qwen) message history it didn't produce and no shared
+-plan — it doesn't know what the primary model (Kimi) was mid-way through
+-doing, so it improvises: re-calling tools redundantly, or answering a
+-different implicit question instead of finishing the pending step. This is
+-exactly what happened with the "call me Tuddy" -> read_memory -> edit_file
+-flow: Kimi started the memory update, failed on the NEXT call, and qwen
+-picked up with no memory of what Kimi was doing.
++fallback model (currently Mistral, formerly Ollama/qwen) message history it
++didn't produce and no shared plan — it doesn't know what the primary model
++(Kimi) was mid-way through doing, so it improvises: re-calling tools
++redundantly, or answering a different implicit question instead of finishing
++the pending step. This is exactly what happened with the "call me Tuddy" ->
++read_memory -> edit_file flow back when qwen was the fallback: Kimi started
++the memory update, failed on the NEXT call, and the fallback model picked up
++with no memory of what Kimi was doing. The fix below is fallback-model
++agnostic — swapping fallback_model doesn't require touching this file.
 
 Fix: only allow a model swap on the FIRST model call of a turn — i.e.
 before any tool call has happened yet this turn (nothing sits between the

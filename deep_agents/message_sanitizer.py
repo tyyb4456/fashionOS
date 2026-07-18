@@ -24,11 +24,19 @@ def _flatten_content(content):
 
 class SanitizeMessagesMiddleware(AgentMiddleware):
     """
-    Strips non-text content blocks (e.g. {'type': 'reasoning', ...}) from AI
-    messages before they're sent to the model. Needed because
-    ModelFallbackMiddleware can hand model2 (Ollama, strict OpenAI-compatible
-    endpoint) message history shaped by model1 (Kimi/Azure) — Ollama rejects
-    any content block that isn't 'text' or 'image_url'.
+    # Strips non-text content blocks (e.g. {'type': 'reasoning', ...}) from AI
+    # messages before they're sent to the model. Needed because
+    # ModelFallbackMiddleware can hand model2 (Ollama, strict OpenAI-compatible
+    # endpoint) message history shaped by model1 (Kimi/Azure) — Ollama rejects
+    # any content block that isn't 'text' or 'image_url'.
+
+    Strips non-text content blocks (e.g. {'type': 'reasoning', ...} from Kimi,
+    {'type': 'thinking', ...} from Mistral) from AI messages before they're
+    sent to the model. Needed because TurnAwareModelFallback can hand model2
+    (Mistral) message history shaped by model1 (Kimi/Azure) or vice versa —
+    Mistral's /chat/completions endpoint 422s on an unrecognized content-block
+    type showing up in assistant history, so both directions get flattened
+    to plain text first.
     """
 
     def before_model(self, state, runtime):

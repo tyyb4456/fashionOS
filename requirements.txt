@@ -33,5 +33,6 @@ svix
 langgraph-checkpoint-redis
 
 langchain-huggingface
-
 langchain-ollama
+langchain-mistralai
+langchain_sambanova

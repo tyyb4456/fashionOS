@@ -190,10 +190,13 @@ async def search_tiktok_hashtag(hashtag: str, limit: int = 20) -> list[dict]:
     
     hashtag = hashtag.lstrip("#").strip().lower()
     limit = min(limit, 50)
-    cache_key = f"fashionos:trend:tiktok:{hashtag}:{limit}"
+    # Cache key intentionally omits `limit` — different limit values for the same
+    # hashtag should hit the same cache entry (we slice below). Avoids a fresh
+    # Apify run every time the agent asks for a slightly different page size.
+    cache_key = f"fashionos:trend:tiktok:{hashtag}"
 
     if (cached := await _cache_get(cache_key)) is not None:
-        return cached
+        return cached[:limit]
 
     run_input = {"hashtags": [hashtag], "resultsPerPage": limit}
 
@@ -239,10 +242,12 @@ async def search_instagram_hashtag(hashtag: str, limit: int = 20) -> list[dict]:
     """
     hashtag = hashtag.lstrip("#").strip().lower()
     limit = min(limit, 50)
-    cache_key = f"fashionos:trend:instagram:{hashtag}:{limit}"
+    # Cache key intentionally omits `limit` — same hashtag, different limit = same
+    # cached data, sliced. Avoids redundant Apify runs when the agent retries.
+    cache_key = f"fashionos:trend:instagram:{hashtag}"
 
     if (cached := await _cache_get(cache_key)) is not None:
-        return cached
+        return cached[:limit]
 
     fetch_limit = min(limit * 3, 150)
     run_input = {"hashtags": [hashtag], "resultsType": "posts", "resultsLimit": fetch_limit}
@@ -309,6 +314,122 @@ async def get_trending_tiktok_sounds(limit: int = 10) -> list[dict]:
         if len(sounds) >= limit:
             break
     return sounds
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BATCH SCRAPING TOOLS — run multiple Apify calls concurrently
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def search_tiktok_hashtags_batch(hashtags: list[str], limit_per: int = 15) -> dict:
+    """
+    Search multiple TikTok hashtags concurrently (up to 4 at once).
+
+    PREFER THIS over calling search_tiktok_hashtag multiple times in a row.
+    Runs all Apify requests in parallel — 4 hashtags take ~60s total instead
+    of 4 × 60s = 240s sequentially, and costs only 1 tool-call budget step.
+
+    Args:
+        hashtags:  List of hashtags WITHOUT '#' (max 4 processed).
+                   E.g. ["PakistaniFashion", "CoordSet", "LawnSuit"]
+        limit_per: Max posts per hashtag (default 15, capped at 50).
+
+    Returns dict keyed by hashtag name:
+        {
+            "pakistanifashion": [...posts (same shape as search_tiktok_hashtag)...],
+            "coordset":         [...posts...],
+        }
+    On per-hashtag error: {"<hashtag>": [{"error": "...", "source": "tiktok"}]}
+    """
+    cleaned = [h.lstrip("#").strip().lower() for h in hashtags[:4]]
+    limit_per = min(limit_per, 50)
+
+    async def _fetch_one(ht: str) -> tuple[str, list[dict]]:
+        # Hit the shared cache first — no Apify call if we have fresh data
+        cache_key = f"fashionos:trend:tiktok:{ht}"
+        if (cached := await _cache_get(cache_key)) is not None:
+            return ht, cached[:limit_per]
+
+        run_input = {"hashtags": [ht], "resultsPerPage": limit_per}
+        try:
+            raw_items = await _run_actor_sync(TIKTOK_ACTOR_ID, run_input, limit=limit_per)
+        except Exception as exc:
+            return ht, [{"error": str(exc), "hashtag": ht, "source": "tiktok"}]
+
+        results = []
+        for item in raw_items[:limit_per]:
+            views, likes = item.get("playCount", 0), item.get("diggCount", 0)
+            comments, shares = item.get("commentCount", 0), item.get("shareCount", 0)
+            created_at = item.get("createTimeISO", "")
+            results.append({
+                "platform": "tiktok", "hashtag": ht, "post_id": item.get("id", ""),
+                "text": (item.get("text") or "")[:300],
+                "author": item.get("authorMeta", {}).get("name", ""),
+                "views": views, "likes": likes, "comments": comments, "shares": shares,
+                "created_at": created_at,
+                "hashtags": [tag.get("name", "") for tag in item.get("hashtags", [])],
+                "music": item.get("musicMeta", {}).get("musicName", ""),
+                "score": round(_engagement_score(views, likes, comments, shares, created_at), 2),
+            })
+        results.sort(key=lambda x: x["score"], reverse=True)
+        await _cache_set(cache_key, results)
+        return ht, results[:limit_per]
+
+    pairs = await asyncio.gather(*[_fetch_one(ht) for ht in cleaned])
+    return {ht: posts for ht, posts in pairs}
+
+
+@mcp.tool()
+async def search_instagram_hashtags_batch(hashtags: list[str], limit_per: int = 15) -> dict:
+    """
+    Search multiple Instagram hashtags concurrently (up to 4 at once).
+
+    PREFER THIS over calling search_instagram_hashtag multiple times in a row.
+    Same parallel-execution benefit as search_tiktok_hashtags_batch.
+
+    Args:
+        hashtags:  List of hashtags WITHOUT '#' (max 4 processed).
+        limit_per: Max posts per hashtag (default 15, capped at 50).
+
+    Returns dict keyed by hashtag name:
+        {"pakistanifashion": [...posts...], "coordset": [...posts...]}
+    On per-hashtag error: {"<hashtag>": [{"error": "...", "source": "instagram"}]}
+    """
+    cleaned = [h.lstrip("#").strip().lower() for h in hashtags[:4]]
+    limit_per = min(limit_per, 50)
+
+    async def _fetch_one(ht: str) -> tuple[str, list[dict]]:
+        cache_key = f"fashionos:trend:instagram:{ht}"
+        if (cached := await _cache_get(cache_key)) is not None:
+            return ht, cached[:limit_per]
+
+        fetch_limit = min(limit_per * 3, 150)
+        run_input = {"hashtags": [ht], "resultsType": "posts", "resultsLimit": fetch_limit}
+        try:
+            raw_items = await _run_actor_sync(INSTAGRAM_ACTOR_ID, run_input, limit=fetch_limit)
+        except Exception as exc:
+            return ht, [{"error": str(exc), "hashtag": ht, "source": "instagram"}]
+
+        results = []
+        for item in raw_items:
+            likes, comments = item.get("likesCount", 0), item.get("commentsCount", 0)
+            created_at = item.get("timestamp", "")
+            results.append({
+                "platform": "instagram", "hashtag": ht, "post_id": item.get("id", ""),
+                "shortcode": item.get("shortCode", ""),
+                "caption": (item.get("caption") or "")[:300],
+                "likes": likes, "comments": comments,
+                "post_type": item.get("type", "image"),
+                "created_at": created_at, "url": item.get("url", ""),
+                "score": round(_engagement_score(0, likes, comments, 0, created_at), 2),
+            })
+        results.sort(key=lambda x: x["score"], reverse=True)
+        results = results[:limit_per]
+        await _cache_set(cache_key, results)
+        return ht, results
+
+    pairs = await asyncio.gather(*[_fetch_one(ht) for ht in cleaned])
+    return {ht: posts for ht, posts in pairs}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
